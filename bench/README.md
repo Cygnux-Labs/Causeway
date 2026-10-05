@@ -48,7 +48,7 @@ Without `--yes`, the Claude mode prints a worst-case call estimate and stops. Ea
 
 ## Results so far: simulated model only
 
-**These numbers test the pipeline and the scoring, not any real LLM.** The simulated model follows injected instructions with fixed probabilities and has no other noise, which is why the replay method looks perfect here. Real-model results are the next step and are not in yet.
+**These numbers test the pipeline and the scoring, not any real LLM.** The simulated model follows injected instructions with fixed probabilities and has no other noise, which is why the replay method looks perfect here. Real-model results are not in yet. Running them is tracked as an [open issue](https://github.com/Cygnux-Labs/Causeway/issues); if you have API access, please run the benchmark and open a pull request with the files in `bench/results/`.
 
 [`results/sim-2026-10-05.md`](results/sim-2026-10-05.md), 20 runs per scenario, n = 30:
 
