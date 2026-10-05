@@ -5,7 +5,7 @@ Releases publish to PyPI as `causeway-ai` through PyPI trusted publishing. No to
 ## One-time setup
 
 1. Create a PyPI account and enable two-factor authentication.
-2. On PyPI, add a pending trusted publisher (Account → Publishing): project `causeway-ai`, owner `Cygnux-Labs`, repository `causeway`, workflow `release.yml`, environment `pypi`.
+2. On PyPI, add a pending trusted publisher (Account → Publishing): project `causeway-ai`, owner `Cygnux-Labs`, repository `Causeway`, workflow `release.yml`, environment `pypi`.
 3. In the GitHub repo: Settings → Environments → New environment `pypi`. Optionally require a reviewer.
 
 ## Each release
