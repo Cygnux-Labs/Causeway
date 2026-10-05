@@ -3,17 +3,31 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "causeway"
-version = "0.2.0"
+name = "causeway-ai"
+version = "0.3.0"
 description = "Causal logs, counterfactual replay and investigation for multi-agent AI systems"
 readme = "README.md"
 requires-python = ">=3.9"
-license = {text = "Proprietary. All rights reserved."}
+license = {text = "Apache-2.0"}
 authors = [{name = "Bravish Ghosh"}]
+keywords = ["ai-agents", "multi-agent", "observability", "causality", "prompt-injection", "llm", "tracing"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development :: Debuggers",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = []
 
 [project.optional-dependencies]
 test = ["pytest"]
+anthropic = ["anthropic"]
+
+[project.urls]
+Homepage = "https://github.com/Cygnux-Labs/causeway"
+Issues = "https://github.com/Cygnux-Labs/causeway/issues"
 
 [project.scripts]
 causeway = "causeway.cli:main"

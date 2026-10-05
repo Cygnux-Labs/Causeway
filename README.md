@@ -6,10 +6,10 @@
 
 *Causal logs, replay and investigation for multi-agent AI systems. Every model call records exactly what it saw. Every tool call links back to the decision that asked for it. When something goes wrong, Causeway traces the action back through the agents, then replays the run without each suspect input to measure which one actually caused it.*
 
-![Status](https://img.shields.io/badge/status-v0.2%20prototype-orange?style=flat-square)
+![Status](https://img.shields.io/badge/status-v0.3%20alpha-orange?style=flat-square)
 ![Python](https://img.shields.io/badge/python-%E2%89%A53.9-3776AB?style=flat-square&logo=python&logoColor=white)
 ![Dependencies](https://img.shields.io/badge/runtime%20deps-none-2ea44f?style=flat-square)
-![License](https://img.shields.io/badge/license-proprietary-lightgrey?style=flat-square)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square)](LICENSE)
 [![CI](https://img.shields.io/badge/CI-pytest%203.9%E2%80%933.13-blue?style=flat-square)](.github/workflows/ci.yml)
 
 <img src="docs/images/why.png" alt="The 'Why did it happen?' screen: a flagged send_email to an outside address, where each argument came from, the path through three agents, and candidate causes marked confirmed, ruled out or not tested." width="100%">
@@ -32,11 +32,14 @@
 - [Server, API and remote agents](#server-api-and-remote-agents)
 - [Command reference](#command-reference)
 - [How it fits together](#how-it-fits-together)
+- [Benchmark](#benchmark)
+- [Related work](#related-work)
 - [Relation to Tracekit](#relation-to-tracekit)
 - [Limits](#limits)
 - [Status and roadmap](#status-and-roadmap)
 - [Repository layout](#repository-layout)
 - [Tests](#tests)
+- [Contributing](#contributing)
 
 ---
 
@@ -115,14 +118,17 @@ A recorded copy of this demo is in [`examples/demo/`](examples/demo/): `report.h
 ## Install
 
 ```bash
-git clone https://github.com/LoopGlitch26/causeway && cd causeway
+pip install causeway-ai          # once the first PyPI release is out; the import name is `causeway`
+
+# or from source
+git clone https://github.com/Cygnux-Labs/causeway && cd causeway
 pip install -e ".[test]"        # Python 3.9+, no runtime dependencies
 causeway demo --out runs        # record the demo and write runs/report.html
 causeway serve runs --allow-program causeway.demo:SYSTEM --token dev-token
 # open http://127.0.0.1:7788
 ```
 
-`pip install anthropic` only if you use the Anthropic adapter.
+`pip install "causeway-ai[anthropic]"` if you use the Anthropic adapter. The PyPI name is `causeway-ai` because `causeway` was already taken.
 
 ## Tour of the app
 
@@ -365,6 +371,33 @@ flowchart LR
 
 Formats and algorithms in detail: [docs/architecture.md](docs/architecture.md).
 
+## Benchmark
+
+[`bench/`](bench/) measures whether Causeway names the input that actually caused a harmful action, against three things you could do without replay:
+
+| Method | Rule |
+|---|---|
+| reach | blame every untrusted input upstream of the action (what tracing alone gives you) |
+| provenance | blame inputs that are the only untrusted source of an argument value (string matching) |
+| reuse | blame the untrusted input whose wording was reused most |
+| **causeway** | replay without each untrusted input, exact paired test per input, false-discovery-rate control across them |
+
+There are five scenarios with one planted cause each (exfiltration, a refund over the limit, a destructive ops command, an injection two agents away, and a working injection next to an ignored one) plus a clean control. Run it with `python -m bench`.
+
+**Current results use a simulated model and only show that the pipeline and scoring work.** On it, replay names exactly the true cause in all 61 harmful runs with no false blames. Tracing alone never isolates it, and string matching is right when the injection plants a unique value but abstains on 39% of runs, where it doesn't. The simulation also shows a hard floor on replay budget: with fewer than 6 replays per input the exact test can never reach significance, and at 10 replays it finds the cause in 69% of runs. **Real-model results are not in yet**; `python -m bench --model claude ...` produces them. Details and limitations: [bench/README.md](bench/README.md).
+
+## Related work
+
+Counterfactual replay for agents is an active research area. Judging from their abstracts, the published methods mostly attribute *task failures* to *steps* or *agents* in a trajectory:
+
+- [Causal Agent Replay](https://arxiv.org/abs/2606.08275) intervenes on individual steps of a single agent's trajectory, reruns forward, and splits credit across interacting steps with a Monte-Carlo Shapley estimator.
+- [CausalFlow](https://arxiv.org/abs/2605.25338) scores which steps caused a single agent's failure and generates minimal repairs that flip the outcome.
+- [TraceElephant](https://arxiv.org/html/2604.22708v1) benchmarks which agent and which step caused failures in multi-agent systems, and finds full traces help considerably over output-only logs.
+- [BranchPoint-Latent](https://arxiv.org/html/2606.14805) predicts which events in multi-agent traces replay would mark as high-effect, without running replays.
+- [From Agent Traces to Trust](https://arxiv.org/html/2606.04990v5) surveys evidence tracing and execution provenance for LLM agents.
+
+Causeway's emphasis is different: it attributes a *specific harmful action* to the *content and message channels* that caused it, across agents, with a recorded data-flow graph. Its replay serves recorded tool results so it can't repeat real side effects. It pairs that with integrity checks, alerts for injection-shaped flows, and a cross-run influence view. Step-level attribution and replay-free prediction are complementary, and both would be useful additions here.
+
 ## Relation to Tracekit
 
 [Tracekit](https://github.com/Cygnux-Labs/Tracekit) is the evidence layer: tool calls signed by a separate OS user, hash-chained, checkpointed to an external witness, and verifiable offline. It proves *what* was recorded and that the record wasn't changed.
@@ -382,7 +415,7 @@ Causeway is the analysis layer: *why* things happened, and whether that holds up
 
 - **An effect is a total effect for this program on this task.** It doesn't explain the model's internal reasons, and it may not transfer to other tasks.
 - **"Ruled out" is bounded, not zero.** At n = 40 the demo's intervals are about ±18 points. Raise n for tighter bounds.
-- **No multiple-comparison correction.** Testing every channel and input means about 1 in 20 true nulls will come out "causal" by chance at 95%.
+- **Multiple comparisons.** Each test reports an exact paired p-value, and the benchmark applies false-discovery-rate control across an action's inputs. The app's verdicts still use each test's own 95% interval, so testing many inputs there can produce chance "causal" results.
 - **The graph is only as complete as the recorded context.** If your code sends a model something it doesn't record, the graph misses it. The Anthropic adapter closes that gap for that SDK; a model-proxy cross-check like Tracekit's would close it in general.
 - **Replay costs model calls**: about 2·n per test per downstream model call. There are no budgets or caching yet.
 - **Run replay needs a re-executable program.** Decision replay doesn't, but decisions recorded through the adapter can't be decision-replayed yet.
@@ -392,13 +425,13 @@ Causeway is the analysis layer: *why* things happened, and whether that holds up
 
 ## Status and roadmap
 
-v0.2 is a working prototype, good for design-partner demos. It is not a production service.
+v0.3 is an alpha: it works and is tested, but it is not a production service.
 
 | Area | State |
 |---|---|
 | SDK, event schema, hash chain | Working, tested |
 | Investigation app (static and live) | Working; checked in a browser in light, dark and phone layouts |
-| Run and decision replay with intervals | Working on the demo; not yet run against a real model |
+| Run and decision replay with intervals and exact paired tests | Working on the demo and the simulated benchmark; not yet run against a real model |
 | Ingestion with integrity checks | Working, single shared token |
 | Anthropic adapter | Working against a fake client |
 | App and API authentication, users, roles, SSO | Not built; localhost only |
@@ -410,7 +443,7 @@ v0.2 is a working prototype, good for design-partner demos. It is not a producti
 
 Next steps, roughly in order:
 
-1. Run the Anthropic adapter against live models on a real multi-agent workload and publish the numbers.
+1. Run the benchmark against real models (`python -m bench --model claude`) and publish the numbers.
 2. Decision replay for adapter-recorded calls.
 3. Write events through Tracekit's signer.
 4. Authentication, tenants, and a database backend.
@@ -430,8 +463,10 @@ examples/
   remote_agent.py          ship events to a collector
   demo/report.html         the app with the 8 recorded demo runs embedded
   demo/runs.tar.gz         the raw logs of those runs and their tests
+bench/                     attribution benchmark: scenarios, baselines, scoring, results
 docs/
   architecture.md          formats, algorithms, statistics, API
+  releasing.md             PyPI release steps
   images/                  screenshots used here
 tests/                     pytest suite
 ```
@@ -442,11 +477,16 @@ tests/                     pytest suite
 make test        # or: python -m pytest -q
 ```
 
-21 tests, run in CI on Python 3.9 to 3.13:
+24 tests, run in CI on Python 3.9 to 3.13:
 
 - `tests/test_causeway.py`: recording and verification; edit, delete, reorder and blob tampering; intervention specs; tape replay never calls live tools off-tape; observed, same-content and inferred edges; taint; deterministic replay; cause vs reach; channel ablation; interval values; structure and cross-run index; the CLI demo end to end.
 - `tests/test_server_adapter.py`: remote ingest then investigate then test through the API; bad token, edited event, gap, forged blob and replayed batch all rejected; replay refused for programs not on the allow-list; the Anthropic adapter links model calls, tool results and injected content, and raises the high alert.
+- `tests/test_bench.py`: exact-test and FDR values; the benchmark attributes a scenario string matching can't; the control produces no harmful action.
+
+## Contributing
+
+Adapters for other frameworks, new benchmark scenarios and real-model benchmark runs are the most useful contributions right now. See [CONTRIBUTING.md](CONTRIBUTING.md). Report security issues privately as described in [SECURITY.md](SECURITY.md).
 
 ## License
 
-Proprietary. Copyright © 2026 Bravish Ghosh / Cygnux Labs. All rights reserved. See [LICENSE](LICENSE).
+Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE). Copyright 2026 Bravish Ghosh and Cygnux Labs.

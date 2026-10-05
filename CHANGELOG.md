@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0 (2026-10-06)
+
+- Licensed under Apache-2.0. PyPI distribution name `causeway-ai` (import name unchanged: `causeway`).
+- Attribution benchmark (`bench/`): five scenarios with a planted cause plus a control, four methods (reach, provenance, reuse, replay), simulated and Claude backends, Markdown and JSON results.
+- Counterfactual tests report an exact McNemar p-value; `benjamini_hochberg` for false-discovery-rate control.
+- CONTRIBUTING, SECURITY, NOTICE, issue and PR templates, PyPI release workflow with trusted publishing.
+- README: benchmark and related-work sections.
+
 ## 0.2.0 (2026-10-06)
 
 - Investigation app: runs list, overview, timeline, "why did it happen?", graph, agents, cross-run influence. Works as a static report or served live.
