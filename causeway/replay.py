@@ -76,6 +76,29 @@ def wilson(k: int, n: int, z: float = Z95):
     return (max(0.0, c - h), min(1.0, c + h))
 
 
+def mcnemar_exact(b: int, c: int) -> float:
+    """Two-sided exact McNemar test on discordant pairs: b pairs where the target happened only with
+    the item, c pairs where it happened only without it. Returns the p-value."""
+    n = b + c
+    if n == 0:
+        return 1.0
+    k = min(b, c)
+    tail = sum(math.comb(n, i) for i in range(k + 1)) / 2 ** n
+    return min(1.0, 2 * tail)
+
+
+def benjamini_hochberg(pvalues: List[float], q: float = 0.05) -> List[bool]:
+    """Which hypotheses to reject while controlling the false discovery rate at q."""
+    m = len(pvalues)
+    order = sorted(range(m), key=lambda i: pvalues[i])
+    cutoff = 0
+    for rank, i in enumerate(order, 1):
+        if pvalues[i] <= q * rank / m:
+            cutoff = rank
+    keep = set(order[:cutoff])
+    return [i in keep for i in range(m)]
+
+
 def newcombe_diff(k0: int, n0: int, k1: int, n1: int, z: float = Z95):
     """95% CI for p0 - p1 (Newcombe hybrid score method)."""
     p0, p1 = k0 / n0, k1 / n1
@@ -141,6 +164,7 @@ def counterfactual(run: Run, intervention: str, target: str, *, n: int = 30, sys
         "p_with": round(p0, 4), "p_without": round(p1, 4),
         "effect": round(p0 - p1, 4), "ci": [round(lo, 4), round(hi, 4)],
         "verdict": verdict, "pair_flips": flips,
+        "p_value": round(mcnemar_exact(flips["removed"], flips["added"]), 6),
         "intervention_applied_in": matched, "off_tape_actions": off_tape,
         "method": "paired re-execution, tool results from tape, Newcombe 95% CI", "scope": "run",
     }
