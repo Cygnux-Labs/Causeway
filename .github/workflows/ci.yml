@@ -19,3 +19,4 @@ jobs:
       - run: python -m pytest -q
       - run: causeway demo --out /tmp/demo --n 10
       - run: causeway verify /tmp/demo/demo-seed0
+      - run: python -m bench --runs 5 --n 20 --out /tmp/bench
