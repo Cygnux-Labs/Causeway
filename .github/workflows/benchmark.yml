@@ -1,0 +1,96 @@
+name: Benchmark
+# Runs the attribution benchmark against a real Claude model and commits the results to bench/results/.
+# One-time setup: add a repository secret named ANTHROPIC_API_KEY (Settings > Secrets and variables > Actions).
+# Then: Actions > Benchmark > Run workflow. Six scenarios run in parallel; each is capped at max_calls model calls.
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: Claude model id
+        default: claude-haiku-4-5-20251001
+        required: true
+      runs:
+        description: Recorded runs per scenario
+        default: "8"
+        required: true
+      n:
+        description: Replays per suspect input (10 or more)
+        default: "15"
+        required: true
+      max_calls:
+        description: Cap on model calls per scenario
+        default: "1500"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  scenario:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [exfil-vendor-note, refund-override, delete-logs, two-hop-bcc, admin-escalation, control-clean]
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      MODEL: ${{ inputs.model }}
+      RUNS: ${{ inputs.runs }}
+      N: ${{ inputs.n }}
+      MAX_CALLS: ${{ inputs.max_calls }}
+      SCENARIO: ${{ matrix.scenario }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e .
+      - name: Check the API key secret
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::error::Add a repository secret named ANTHROPIC_API_KEY (Settings > Secrets and variables > Actions)"
+            exit 1
+          fi
+      - name: Run scenario
+        run: |
+          python -m bench --model claude --claude-model "$MODEL" --runs "$RUNS" --n "$N" \
+            --max-calls "$MAX_CALLS" --scenario "$SCENARIO" --tag "$SCENARIO" --out parts --yes
+      - uses: actions/upload-artifact@v4
+        with:
+          name: parts-${{ matrix.scenario }}
+          path: parts/*.json
+
+  report:
+    needs: scenario
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      MODEL: ${{ inputs.model }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e .
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: parts-*
+          merge-multiple: true
+          path: parts
+      - name: Merge results
+        run: |
+          ls parts/*.json
+          stem="bench/results/${MODEL//\//_}-$(date -u +%F)"
+          python -m bench.merge "$stem" parts/*.json
+          cat "$stem.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: Commit results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bench/results
+          git commit -m "Benchmark results: $MODEL" || echo "nothing to commit"
+          git push
