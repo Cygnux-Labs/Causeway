@@ -10,7 +10,7 @@ Thanks for helping. Causeway is early, so the most useful contributions right no
 ## Development setup
 
 ```bash
-git clone https://github.com/Cygnux-Labs/causeway && cd causeway
+git clone https://github.com/Cygnux-Labs/Causeway && cd causeway
 pip install -e ".[test]"
 python -m pytest -q          # must pass on Python 3.9 to 3.13
 python -m bench              # about 6 seconds on the simulated model

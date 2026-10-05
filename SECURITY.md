@@ -3,7 +3,7 @@
 ## Reporting a vulnerability
 
 Please report suspected vulnerabilities privately through
-[GitHub security advisories](https://github.com/Cygnux-Labs/causeway/security/advisories/new)
+[GitHub security advisories](https://github.com/Cygnux-Labs/Causeway/security/advisories/new)
 rather than a public issue. Include the Causeway version (`python -c "import causeway; print(causeway.__version__)"`),
 your platform, and steps to reproduce. You can expect an acknowledgement within a few days.
 

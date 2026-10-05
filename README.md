@@ -121,7 +121,7 @@ A recorded copy of this demo is in [`examples/demo/`](examples/demo/): `report.h
 pip install causeway-ai          # once the first PyPI release is out; the import name is `causeway`
 
 # or from source
-git clone https://github.com/Cygnux-Labs/causeway && cd causeway
+git clone https://github.com/Cygnux-Labs/Causeway && cd causeway
 pip install -e ".[test]"        # Python 3.9+, no runtime dependencies
 causeway demo --out runs        # record the demo and write runs/report.html
 causeway serve runs --allow-program causeway.demo:SYSTEM --token dev-token
@@ -384,7 +384,7 @@ Formats and algorithms in detail: [docs/architecture.md](docs/architecture.md).
 
 There are five scenarios with one planted cause each (exfiltration, a refund over the limit, a destructive ops command, an injection two agents away, and a working injection next to an ignored one) plus a clean control. Run it with `python -m bench`.
 
-**Current results use a simulated model and only show that the pipeline and scoring work.** On it, replay names exactly the true cause in all 61 harmful runs with no false blames. Tracing alone never isolates it, and string matching is right when the injection plants a unique value but abstains on 39% of runs, where it doesn't. The simulation also shows a hard floor on replay budget: with fewer than 6 replays per input the exact test can never reach significance, and at 10 replays it finds the cause in 69% of runs. **Real-model results are not in yet**; `python -m bench --model claude ...` produces them. Details and limitations: [bench/README.md](bench/README.md).
+**Current results use a simulated model and only show that the pipeline and scoring work.** On it, replay names exactly the true cause in all 61 harmful runs with no false blames. Tracing alone never isolates it, and string matching is right when the injection plants a unique value but abstains on 39% of runs, where it doesn't. The simulation also shows a hard floor on replay budget: with fewer than 6 replays per input the exact test can never reach significance, and at 10 replays it finds the cause in 69% of runs. **Real-model results are not in yet.** Running the benchmark against real models is an [open issue](https://github.com/Cygnux-Labs/Causeway/issues) and a good way to contribute: `python -m bench --model claude --claude-model <id>` locally, or the Benchmark workflow in Actions with an API key secret. Details and limitations: [bench/README.md](bench/README.md).
 
 ## Related work
 
@@ -441,14 +441,18 @@ v0.3 is an alpha: it works and is tested, but it is not a production service.
 | Signing and external witness via Tracekit | Not built |
 | Replay budgets, caching, choosing which edges to test | Not built |
 
-Next steps, roughly in order:
+Next steps, roughly in order. Each one is tracked as a [GitHub issue](https://github.com/Cygnux-Labs/Causeway/issues).
 
-1. Run the benchmark against real models (`python -m bench --model claude`) and publish the numbers.
-2. Decision replay for adapter-recorded calls.
-3. Write events through Tracekit's signer.
-4. Authentication, tenants, and a database backend.
-5. OpenTelemetry import, so teams can bring existing traces.
-6. Replay cost controls and automatic choice of which edges to test.
+1. Run the benchmark against real models and publish the numbers.
+2. An LLM gateway (OpenAI-compatible and Anthropic endpoints), so any agent can be recorded by changing one base URL.
+3. Adapters for the OpenAI SDK, LangGraph and the OpenAI Agents SDK.
+4. OpenTelemetry GenAI import, so teams can bring traces they already have.
+5. An MCP proxy that records tool calls and serves the replay tape without code changes.
+6. Decision replay for adapter-recorded calls.
+7. Write events through Tracekit's signer.
+8. Authentication for `causeway serve`, then tenants and a database backend.
+9. PII redaction in the SDK.
+10. Replay cost controls: adaptive stopping and ranking which inputs to test first.
 
 ## Repository layout
 
