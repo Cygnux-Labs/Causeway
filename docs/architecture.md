@@ -155,7 +155,10 @@ This measures the direct effect on one model call. It does not need the program 
 - **Wilson score interval** for a single proportion.
 - **Newcombe hybrid score interval** (method 10) for a difference of two proportions, built from the two Wilson intervals. It behaves well at 0% and 100%, which plain Wald intervals do not.
 
-Both are computed at 95% (z = 1.96). The tests are treated as independent pairs. No multiple-comparison correction is applied across many tests, so when you test every channel and input of a run, expect roughly 1 in 20 false "causal" verdicts on true nulls.
+- **Exact McNemar test** on the discordant pairs (target happened only with the item, or only without it). Its p-value is reported as `p_value`. With b discordant pairs all in one direction the smallest possible p is 2 × 0.5^b, so fewer than 6 discordant pairs can never reach p < 0.05.
+- **Benjamini–Hochberg** (`replay.benjamini_hochberg`) controls the false discovery rate when several inputs of one action are tested. The benchmark uses it at q = 0.05.
+
+Intervals are computed at 95% (z = 1.96). The app's verdicts use each test's own interval and are not corrected across tests.
 
 ## Server and ingestion
 
