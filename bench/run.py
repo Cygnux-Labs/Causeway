@@ -101,6 +101,9 @@ def run_scenario(sc: Scenario, model: str, runs: int, n: int, args, workdir: str
     harmful_runs = 0
     high_alert_runs = 0
     record_calls = 0
+    skipped = 0
+    max_calls = getattr(args, "max_calls", None)
+    model_agents = len(sc.researchers) + 1
     for seed in range(runs):
         before = counter.calls
         r = system.run(seed=seed, out_dir=os.path.join(workdir, sc.id), run_id=f"{sc.id}-{seed}")
@@ -111,6 +114,11 @@ def run_scenario(sc: Scenario, model: str, runs: int, n: int, args, workdir: str
         if sc.harmful is None or not target_hits(run, sc.harmful):
             continue
         harmful_runs += 1
+        n_cands = len({e["source"] for e in run.of_type("input") if e.get("trust") == "untrusted"})
+        if max_calls and counter.calls + 2 * n * model_agents * n_cands > max_calls:
+            skipped += 1  # over budget: count the harmful run, skip its replay tests
+            print(f"  {sc.id} seed {seed}: harmful, attribution skipped (call budget {max_calls})", flush=True)
+            continue
         before = counter.calls
         att = attribute(run, sc, system, n)
         att["replay_calls"] = counter.calls - before
@@ -132,6 +140,7 @@ def run_scenario(sc: Scenario, model: str, runs: int, n: int, args, workdir: str
                 "false_blames_per_run": statistics.mean(x["false_blames"] for x in s)}
 
     return {"scenario": sc.id, "title": sc.title, "runs": runs, "harmful_runs": harmful_runs,
+            "attributed_runs": len(rows), "skipped_for_budget": skipped, "model_calls": counter.calls,
             "high_alert_runs": high_alert_runs, "string_matching": sc.what_string_matching_sees,
             "methods": {m: agg(m) for m in METHODS},
             "high_alert_on_harmful": (sum(r["high_alert"] for r in rows) / len(rows)) if rows else None,
@@ -154,20 +163,24 @@ def markdown(res: Dict[str, Any]) -> str:
          "| Scenario | Harmful runs | Reach exact | Provenance exact / abstain | Reuse exact | **Causeway exact** | Causeway false blames / run | Replay calls / attribution |",
          "|---|---|---|---|---|---|---|---|"]
     for s in res["scenarios"]:
-        if s["harmful_runs"] == 0:
-            L.append(f"| {s['scenario']} | 0 of {s['runs']} | – | – | – | – | – | – |")
+        if not s.get("attributed_runs", s["harmful_runs"]):
+            L.append(f"| {s['scenario']} | {s['harmful_runs']} of {s['runs']} | – | – | – | – | – | – |")
             continue
         m = s["methods"]
-        L.append(f"| {s['scenario']} | {s['harmful_runs']} of {s['runs']} | {pct(m['reach']['exact'])} | "
+        att = s.get("attributed_runs", s["harmful_runs"])
+        hr = f"{s['harmful_runs']} of {s['runs']}" + (f" ({att} tested)" if att < s["harmful_runs"] else "")
+        L.append(f"| {s['scenario']} | {hr} | {pct(m['reach']['exact'])} | "
                  f"{pct(m['provenance']['exact'])} / {pct(m['provenance']['abstain'])} | {pct(m['reuse']['exact'])} | "
                  f"**{pct(m['causeway']['exact'])}** | {m['causeway']['false_blames_per_run']:.2f} | "
                  f"{s['replay_calls_per_attribution']:.0f} |")
-    tot = [s for s in res["scenarios"] if s["harmful_runs"]]
+    tot = [s for s in res["scenarios"] if s.get("attributed_runs", s["harmful_runs"])]
     if tot:
+        def k(s):
+            return s.get("attributed_runs", s["harmful_runs"])
+
         def w(meth, key):
-            num = sum(s["methods"][meth][key] * s["harmful_runs"] for s in tot)
-            return num / sum(s["harmful_runs"] for s in tot)
-        L.append(f"| **All** | {sum(s['harmful_runs'] for s in tot)} | {pct(w('reach','exact'))} | "
+            return sum(s["methods"][meth][key] * k(s) for s in tot) / sum(k(s) for s in tot)
+        L.append(f"| **All** | {sum(k(s) for s in tot)} attributed | {pct(w('reach','exact'))} | "
                  f"{pct(w('provenance','exact'))} / {pct(w('provenance','abstain'))} | {pct(w('reuse','exact'))} | "
                  f"**{pct(w('causeway','exact'))}** | {w('causeway','false_blames_per_run'):.2f} | – |")
     ctrl = [s for s in res["scenarios"] if s["scenario"].startswith("control")]
@@ -177,6 +190,12 @@ def markdown(res: Dict[str, Any]) -> str:
     if ctrl:
         c = ctrl[0]
         L += ["", f"**Control (no injection):** high alerts in {c['high_alert_runs']} of {c['runs']} runs."]
+    skipped = sum(s.get("skipped_for_budget", 0) for s in res["scenarios"])
+    calls = sum(s.get("model_calls", 0) for s in res["scenarios"])
+    tin = sum(s.get("tokens", {}).get("input", 0) for s in res["scenarios"])
+    tout = sum(s.get("tokens", {}).get("output", 0) for s in res["scenarios"])
+    L += ["", f"Model calls: {calls:,}" + (f" · tokens: {tin:,} in, {tout:,} out" if tin else "") +
+          (f" · harmful runs not attributed because of the call budget: {skipped}" if skipped else "")]
     return "\n".join(L) + "\n"
 
 
@@ -191,6 +210,8 @@ def main(argv=None) -> int:
     ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "results"))
     ap.add_argument("--keep-runs", help="write the recorded runs here instead of a temp folder")
     ap.add_argument("--yes", action="store_true", help="skip the cost confirmation for real models")
+    ap.add_argument("--max-calls", type=int, help="per-scenario cap on model calls; replay tests that would pass it are skipped")
+    ap.add_argument("--tag", help="extra word in the result file name, e.g. the scenario in a parallel run")
     a = ap.parse_args(argv)
     if a.model == "claude" and not a.claude_model:
         ap.error("--claude-model is required with --model claude")
@@ -207,7 +228,7 @@ def main(argv=None) -> int:
         print(f"== {sc.id}: {sc.title}", flush=True)
         res["scenarios"].append(run_scenario(sc, a.model, a.runs, a.n, a, workdir))
     os.makedirs(a.out, exist_ok=True)
-    stem = os.path.join(a.out, f"{res['model'].replace('/', '_')}-{res['date']}")
+    stem = os.path.join(a.out, f"{res['model'].replace('/', '_')}-{res['date']}" + (f"-{a.tag}" if a.tag else ""))
     with open(stem + ".json", "w") as f:
         json.dump(res, f, indent=2, default=list)
     md = markdown(res)

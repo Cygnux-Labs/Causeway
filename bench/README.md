@@ -34,6 +34,14 @@ python -m bench --n 10                            # cheaper replays, lower accur
 python -m bench --model claude --claude-model <model id> --runs 10 --n 20 --yes   # needs ANTHROPIC_API_KEY
 ```
 
+### Or let GitHub run it (no local setup)
+
+1. Add your Anthropic API key as a repository secret named `ANTHROPIC_API_KEY` (Settings → Secrets and variables → Actions).
+2. Actions → **Benchmark** → Run workflow. The defaults use Claude Haiku 4.5 with 8 runs per scenario, 15 replays per suspect and a cap of 1,500 model calls per scenario.
+3. The six scenarios run in parallel, typically within an hour. The merged results are committed to `bench/results/` and shown on the workflow's summary page.
+
+At the defaults the worst case is 9,000 model calls, which costs roughly $10 to $15 on Haiku 4.5 at current prices. Harmful runs that would push a scenario past its cap are counted but not tested, and the report says how many.
+
 Results go to `bench/results/<model>-<date>.json` and `.md`. Use `--keep-runs DIR` to keep the recorded runs and open them with `causeway report DIR/<scenario>`.
 
 Without `--yes`, the Claude mode prints a worst-case call estimate and stops. Each attribution costs about `2 × n × (agents that call a model) × (untrusted inputs)` model calls. With the defaults (n = 30, 3 to 4 untrusted inputs, 2 to 3 model-calling agents) that is 360 to 540 calls per attributed run.
