@@ -279,6 +279,8 @@ def nodes_matching(g: Graph, spec: str) -> List[str]:
 
 def _attach_tests(g: Graph, run: Run) -> None:
     for t in run.tests:
+        if t.get("group"):
+            continue  # removing several items at once says nothing about any one of them
         if t.get("scope") == "decision":
             dec = "ev:" + t["decision"]
             ctx = {c["ref"] for c in g.nodes[dec]["event"]["context"]} if dec in g.nodes else set()
