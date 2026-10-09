@@ -1,6 +1,7 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Causeway</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%232b5bd7' stroke-width='2'%3E%3Ccircle cx='5' cy='6' r='2.2'/%3E%3Ccircle cx='5' cy='18' r='2.2'/%3E%3Ccircle cx='19' cy='12' r='2.2'/%3E%3Cpath d='M7 6.8 16.9 11M7 17.2 16.9 13'/%3E%3C/svg%3E">
 <style>
 :root{--bg:#f6f6f3;--panel:#ffffff;--soft:#f0f0ec;--ink:#1c1c1a;--muted:#6a6a64;--faint:#9b9b94;--line:#e2e2dc;--line2:#d0d0c9;
 --accent:#2b5bd7;--accent-soft:#e7eefc;--high:#c8312f;--high-soft:#fbe9e8;--review:#a86400;--review-soft:#fbf1df;--ok:#1d7a4f;--ok-soft:#e4f3ea;
@@ -114,7 +115,7 @@ const sgn=x=>(x>0?"+":"")+(Math.round(x*100)/100).toFixed(2);
 const ms=x=>x==null?"":x<1?(x*1000).toFixed(0)+" µs":x<1000?x.toFixed(1)+" ms":(x/1000).toFixed(2)+" s";
 const trunc=(s,n)=>{s=String(s??"");return s.length>n?s.slice(0,n-1)+"…":s};
 const short=l=>String(l).replace(/^[a-z]+:(.*\/)?/i,"");
-function toast(m){const t=$("#toast");t.textContent=m;t.classList.add("on");clearTimeout(toast.t);toast.t=setTimeout(()=>t.classList.remove("on"),2200)}
+function toast(m,dur){const t=$("#toast");t.textContent=m;t.classList.add("on");clearTimeout(toast.t);toast.t=setTimeout(()=>t.classList.remove("on"),dur||2200)}
 (function(){try{const t=localStorage.getItem("cw-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}})();
 $("#theme").onclick=()=>{const cur=document.documentElement.dataset.theme||(matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light");const n=cur==="dark"?"light":"dark";document.documentElement.dataset.theme=n;try{localStorage.setItem("cw-theme",n)}catch(e){}};
 $("#mode").textContent=SERVER?"live · causeway serve":"static report";
@@ -123,11 +124,25 @@ $("#mode").textContent=SERVER?"live · causeway serve":"static report";
 async function getJSON(u,opt){const r=await fetch(u,opt);if(!r.ok)throw new Error((await r.text())||r.status);return r.json()}
 async function loadWorkspace(){if(SERVER){const w=await getJSON("api/workspace");const d=DATA&&DATA.details||{};DATA=w;DATA.details=d}}
 async function detail(id){if(DATA.details&&DATA.details[id])return DATA.details[id];const d=await getJSON("api/runs/"+encodeURIComponent(id));DATA.details[id]=d;return d}
+/* ------------------------------------------------------------------ live: server-sent events from causeway serve */
+const LIVE={pending:false,t:null};
+function liveRefresh(){clearTimeout(LIVE.t);LIVE.t=setTimeout(async()=>{const a=document.activeElement;
+ if(a&&a.closest&&a.closest("#app")&&/INPUT|SELECT|TEXTAREA/.test(a.tagName)){LIVE.pending=true;return}  /* don't wipe what the user is typing */
+ LIVE.pending=false;const y=window.scrollY;try{await loadWorkspace();await render();window.scrollTo(0,y)}catch(e){}},400)}
+function startLive(){if(!SERVER||!window.EventSource)return;const m=$("#mode"),es=new EventSource("api/stream");
+ es.onopen=()=>{m.textContent="● live";m.style.color="var(--ok)"};
+ es.onerror=()=>{m.textContent="reconnecting…";m.style.color="var(--review)"};
+ es.onmessage=ev=>{let x;try{x=JSON.parse(ev.data)}catch(e){return}
+  if(DATA&&DATA.details)delete DATA.details[x.run_id];
+  const hi=(x.alerts||[]).filter(a=>a.severity==="high");
+  if(hi.length)toast(`⚑ ${x.run_id}: ${hi[0].title}`,6000);
+  liveRefresh()};
+ document.addEventListener("focusout",()=>{if(LIVE.pending)liveRefresh()})}
 let AG={};function agentColor(a){if(!(a in AG))AG[a]=Object.keys(AG).length%6;return `var(--a${AG[a]})`}
 const agent=a=>`<span class="agent"><span class="dot" style="background:${agentColor(a)}"></span>${esc(a)}</span>`;
 const sevPill=s=>`<span class="pill p-${s}">${{high:"High",review:"Review",info:"Info"}[s]}</span>`;
-const STATUS={confirmed:["p-cause","Confirmed cause"],"ruled-out":["p-ruled","Ruled out"],untested:["p-untested","Not tested"],suppressive:["p-accent","Suppresses it"]};
-const statusPill=s=>`<span class="pill ${STATUS[s][0]}">${STATUS[s][1]}</span>`;
+const STATUS={confirmed:["p-cause","Primary cause"],contributing:["p-review","Contributing factor"],"ruled-out":["p-ruled","Ruled out"],inconclusive:["p-untested","Inconclusive"],untested:["p-untested","Not tested"],suppressive:["p-accent","Suppresses it"]};
+const statusPill=(s,role)=>`<span class="pill ${STATUS[s][0]}">${s==="confirmed"&&role!=="primary"?"Confirmed cause":STATUS[s][1]}</span>`;
 const TYPE={input:"Input",decision:"Model call",action:"Tool call",message:"Message"};
 
 /* effect bar: domain -1..1, zero in the middle; dot = effect, whisker = 95% CI */
@@ -152,7 +167,7 @@ function renderRuns(app){const R=DATA.runs;const high=R.reduce((s,r)=>s+r.alerts
  app.innerHTML=`<h1>Runs</h1><p class="sub">Every recorded multi-agent run. Open one to see what happened and why.</p>
  <div class="grid tiles" style="margin:14px 0 18px">${tile("Runs",R.length)}${tile("High alerts",high,high>0)}${tile("Tool calls recorded",acts)}${tile("Confirmed causes",causes)}</div>
  <div class="tw"><table><thead><tr><th>Run</th><th>Started (UTC)</th><th>Agents</th><th class="num">Model calls</th><th class="num">Tool calls</th><th>Alerts</th><th class="num">Tests</th><th>Log</th></tr></thead><tbody>
- ${R.map(r=>`<tr class="click" data-href="#/run/${encodeURIComponent(r.run_id)}"><td><div class="mono">${esc(r.run_id)}</div><div class="sub" style="font-size:12.5px">${esc(trunc(r.task||"",90))}</div></td>
+ ${R.map(r=>`<tr class="click" data-href="#/run/${encodeURIComponent(r.run_id)}"><td><div class="mono">${esc(r.run_id)}${r.finished===false?` <span class="pill p-accent">running</span>`:""}${r.guard?` <span class="pill p-untested">guard: ${esc(r.guard)}</span>`:""}</div><div class="sub" style="font-size:12.5px">${esc(trunc(r.task||"",90))}</div></td>
  <td class="mono sub">${esc(r.started.slice(0,19).replace("T"," "))}</td><td>${r.agents.length}</td><td class="num">${r.decisions}</td><td class="num">${r.actions}</td>
  <td><div class="row">${r.alerts.high?`<span class="pill p-high">${r.alerts.high} high</span>`:""}${r.alerts.review?`<span class="pill p-review">${r.alerts.review} review</span>`:""}${!r.alerts.high&&!r.alerts.review?`<span class="sub">none</span>`:""}</div></td>
  <td class="num">${r.tests}${r.confirmed_causes?` <span class="sub">(${r.confirmed_causes} causal)</span>`:""}</td><td>${r.integrity==="ok"?`<span class="pill p-ok">intact</span>`:`<span class="pill p-high">failed</span>`}</td></tr>`).join("")}
@@ -192,7 +207,7 @@ function tTimeline(el,d){const agents=[...new Set(d.timeline.map(r=>r.agent))];
  const draw=()=>{const flagged=new Set(d.alerts.map(a=>a.node));const rows=d.timeline.filter(r=>(!TL.agent||r.agent===TL.agent)&&(!TL.type||r.type===TL.type)&&(!TL.flag||flagged.has(r.node)||r.trust==="untrusted"&&r.type==="input")&&(!TL.q||r.text.toLowerCase().includes(TL.q.toLowerCase())));
   $("#tl").innerHTML=`<table><thead><tr><th class="num">Time</th><th>Agent</th><th>Event</th><th>What happened</th><th class="num">Took</th></tr></thead><tbody>${rows.map(r=>{const node=d.nodes.find(n=>n.id===r.node);
   const badges=[r.trust==="untrusted"&&r.type==="input"?`<span class="pill p-untrusted">untrusted</span>`:"",r.sensitive?`<span class="pill p-sens">sensitive</span>`:"",r.status==="error"?`<span class="pill p-high">error</span>`:"",r.mode==="stub"?`<span class="pill p-info">stub</span>`:"",flagged.has(r.node)?`<span class="pill p-high">⚑ alert</span>`:""].join(" ");
-  return `<tr class="${node?"click":""}" data-node="${node?esc(r.node):""}"><td class="num mono sub">+${r.t_ms.toFixed(1)} ms</td><td>${r.agent==="run"?`<span class="sub">run</span>`:agent(r.agent)}</td><td class="sub" style="white-space:nowrap">${TYPE[r.type]||r.type.replace(".", " ")}</td><td>${esc(r.text)} ${badges}</td><td class="num sub">${ms(r.duration_ms)}</td></tr>`}).join("")||`<tr><td colspan="5" class="empty">Nothing matches.</td></tr>`}</tbody></table>`;
+  return `<tr class="${node?"click":""}" data-node="${node?esc(r.node):""}"><td class="num mono sub">+${r.t_ms.toFixed(1)} ms</td><td>${r.agent==="run"?`<span class="sub">run</span>`:agent(r.agent)}</td><td class="sub" style="white-space:nowrap">${TYPE[r.type]||esc(r.type.replace(".", " "))}</td><td>${esc(r.text)} ${badges}</td><td class="num sub">${ms(r.duration_ms)}</td></tr>`}).join("")||`<tr><td colspan="5" class="empty">Nothing matches.</td></tr>`}</tbody></table>`;
   $("#tl").querySelectorAll("tr[data-node]").forEach(tr=>{if(tr.dataset.node)tr.onclick=()=>openNode(d,tr.dataset.node)})};
  $("#f-agent").onchange=e=>{TL.agent=e.target.value;draw()};$("#f-flag").onchange=e=>{TL.flag=e.target.checked;draw()};$("#f-q").oninput=e=>{TL.q=e.target.value;draw()};
  $("#f-type").querySelectorAll("button").forEach(b=>b.onclick=()=>{TL.type=b.dataset.k;$("#f-type").querySelectorAll("button").forEach(x=>x.classList.toggle("on",x===b));draw()});draw()}
@@ -203,28 +218,33 @@ function tWhy(el,d,sel){const base="#/run/"+encodeURIComponent(d.run_id);const a
  const sev={};d.alerts.forEach(a=>{if(a.node&&!(a.node in sev))sev[a.node]=a.severity});
  const ordered=[...acts].sort((a,b)=>({high:0,review:1,info:2}[sev[a.id]]??3)-({high:0,review:1,info:2}[sev[b.id]]??3)||a.seq-b.seq);
  sel=sel&&d.actions[sel]?sel:ordered[0].id;const n=d.nodes.find(x=>x.id===sel),A=d.actions[sel];
- const conf=A.candidates.filter(c=>c.status==="confirmed"),ruled=A.candidates.filter(c=>c.status==="ruled-out"),unt=A.candidates.filter(c=>c.status==="untested");
+ const conf=A.candidates.filter(c=>c.status==="confirmed"),contrib=A.candidates.filter(c=>c.status==="contributing"),ruled=A.candidates.filter(c=>c.status==="ruled-out"),inc=A.candidates.filter(c=>c.status==="inconclusive"),unt=A.candidates.filter(c=>c.status==="untested");
  let verdict;
- if(conf.length){const c=conf[0],t=c.test;verdict=`<b>Confirmed cause: ${esc(c.label)}.</b> In replays without it, this action happened ${pct(t.p_without)} of the time instead of ${pct(t.p_with)} (n=${t.n}; 95% interval for the drop: ${Math.round(t.ci[0]*100)} to ${Math.round(t.ci[1]*100)} points).`+(conf.length>1?` ${conf.length-1} more confirmed.`:"")}
- else if(ruled.length)verdict=`<b>No confirmed cause yet.</b> ${ruled.length} tested source${ruled.length>1?"s":""} made no detectable difference.`;
+ if(conf.length){const c=conf[0],t=c.test;verdict=`<b>${c.role==="primary"?"Primary cause":"Confirmed cause"}: ${esc(c.label)}.</b> In replays without it, this action happened ${pct(t.p_without)} of the time instead of ${pct(t.p_with)} (n=${t.n}; 95% interval for the drop: ${Math.round(t.ci[0]*100)} to ${Math.round(t.ci[1]*100)} points).`+(conf.length>1?` ${conf.length-1} more confirmed.`:"")}
+ else if(contrib.length){const c=contrib[0],t=c.test;verdict=`<b>Contributing factor: ${esc(c.label)}.</b> It makes this action more likely (${pct(t.p_with)} with it, ${pct(t.p_without)} without), but the action mostly happens without it too. Look for why the agent does this on its own.`}
+ else if(inc.length)verdict=`<b>No confirmed cause yet, and the tests can't tell.</b> The action reproduced too rarely in replays to separate a real effect from none${inc[0].test&&inc[0].test.n_needed?` (try n=${inc[0].test.n_needed})`:""}.`;
+ else if(ruled.length)verdict=`<b>No confirmed cause yet.</b> ${ruled.length} tested source${ruled.length>1?"s":""} had no effect larger than ${Math.round(((ruled[0].test&&ruled[0].test.min_effect)||.2)*100)} points.`;
  else verdict=`<b>Not tested yet.</b> ${A.candidates.length} inputs and channels reached this action. Start with the untrusted ones.`;
- if(conf.length||ruled.length)verdict+=` ${ruled.length} ruled out, ${unt.length} not tested.`;
+ if(conf.length&&contrib.length)verdict+=` Contributing: ${contrib.map(c=>esc(c.label)).join(", ")}.`;
+ if(conf.length||contrib.length||ruled.length||inc.length)verdict+=` ${ruled.length} ruled out, ${inc.length} inconclusive, ${unt.length} not tested.`;
  el.innerHTML=`<div class="split"><div><h3>Tool calls</h3><select class="picker-sel" id="pick-sel">${ordered.map(a=>`<option value="${esc(a.id)}" ${a.id===sel?"selected":""}>${sev[a.id]==="high"?"⚑ ":""}${esc(a.label)} · ${esc(a.agent)} #${a.seq}</option>`).join("")}</select><div class="picker">${ordered.map(a=>`<button class="${a.id===sel?"on":""}" data-id="${esc(a.id)}">${sev[a.id]?`<span class="dot" style="background:var(--${sev[a.id]==="high"?"high":sev[a.id]==="review"?"review":"faint"})"></span>`:`<span class="dot" style="background:var(--line2)"></span>`}<span style="min-width:0"><div style="font-weight:550">${esc(a.label)}</div><div class="meta">${esc(a.agent)} · #${a.seq} ${esc(trunc(Object.values(a.args||{}).join(", "),26))}</div></span></button>`).join("")}</div></div>
  <div class="stack"><div class="card"><div class="row" style="justify-content:space-between"><div><div class="sub" style="font-size:12px">${esc(n.agent)} ran</div><div style="font-size:18px;font-weight:650">${esc(n.label)}</div></div><div class="row">${A.sensitive?`<span class="pill p-sens">sensitive${A.sensitive==="heuristic"?" (by name)":""}</span>`:""}<button class="btn sm" id="open-act">Details</button></div></div>
- <div class="tw" style="margin-top:10px"><table><thead><tr><th>Argument value</th><th>Where the value came from</th></tr></thead><tbody>${A.provenance.length?A.provenance.map(p=>`<tr><td class="mono">${esc(trunc(p.value,60))}</td><td class="prov">${p.status==="untrusted-only"?`<span class="pill p-high">only from untrusted content</span> `:p.status==="trusted"?`<span class="pill p-ok">from a trusted source</span> `:`<span class="pill p-info">written by the model</span> `}${esc(p.sources.map(s=>s.label).join(", "))}</td></tr>`).join(""):`<tr><td colspan="2" class="sub">No traceable argument values.</td></tr>`}</tbody></table></div></div>
+ <div class="tw" style="margin-top:10px"><table><thead><tr><th>Argument value</th><th>Where the value came from</th></tr></thead><tbody>${A.provenance.length?A.provenance.map(p=>`<tr><td class="mono">${esc(trunc(p.value,60))}</td><td class="prov">${p.status==="untrusted-only"?`<span class="pill p-high">only from untrusted content</span> `:p.status==="trusted"?`<span class="pill p-ok">from a trusted source</span> `:p.status==="hashed"?`<span class="pill p-untested">content hashed: can't trace</span> `:`<span class="pill p-info">written by the model</span> `}${esc(p.sources.map(s=>s.label).join(", "))}</td></tr>`).join(""):`<tr><td colspan="2" class="sub">No traceable argument values.</td></tr>`}</tbody></table></div></div>
  <div class="card verdict">${verdict}</div>
  <section><h3>How it got here</h3>${A.lineage.length?mergedLineage(d,A.lineage):`<div class="sub">No upstream inputs recorded.</div>`}</section>
- <section><div class="row" style="justify-content:space-between;margin-bottom:8px"><h3 style="margin:0">Candidate causes</h3><label class="row sub" style="font-size:12px">Target <input type="text" class="mono target" id="target" value="${esc(A.target)}"></label></div>
+ <section><div class="row" style="justify-content:space-between;margin-bottom:8px"><h3 style="margin:0">Candidate causes</h3>${SERVER&&d.summary.replayable?`<button class="btn sm primary" id="find-cause" title="Remove all untrusted suspects at once, then narrow down">Find the cause</button>`:""}<label class="row sub" style="font-size:12px">Target <input type="text" class="mono target" id="target" value="${esc(A.target)}"></label></div>
  <div class="tw"><table><thead><tr><th>Remove this…</th><th>Status</th><th>Effect on the action</th><th class="num">With → without</th><th class="num" title="Share of this content's wording reused in the next model output">Text reuse</th><th></th></tr></thead><tbody>
  ${A.candidates.map(c=>`<tr><td><div style="font-weight:550">${esc(c.kind==="message"?c.label:short(c.label))}</div><div class="sub" style="font-size:12px">${c.kind==="message"?"message channel":esc(c.label)} ${c.trust==="untrusted"?`<span class="pill p-untrusted" style="font-size:11px">${c.kind==="message"?"carries untrusted content":"untrusted"}</span>`:""}</div></td>
- <td>${statusPill(c.status)}</td><td>${effectBar(c.test)}${c.test?`<div class="sub mono" style="font-size:11.5px">${sgn(c.test.effect)} [${sgn(c.test.ci[0])}, ${sgn(c.test.ci[1])}]</div>`:""}</td>
+ <td>${statusPill(c.status,c.role)}</td><td>${effectBar(c.test)}${c.test?`<div class="sub mono" style="font-size:11.5px">${sgn(c.test.effect)} [${sgn(c.test.ci[0])}, ${sgn(c.test.ci[1])}]</div>`:""}</td>
  <td class="num">${c.test?`${pct(c.test.p_with)} → ${pct(c.test.p_without)}<div class="sub" style="font-size:11.5px">n=${c.test.n}</div>`:"–"}</td><td class="num sub">${c.reuse?Math.round(c.reuse*100)+"%":"–"}</td>
  <td class="num">${SERVER?`<button class="btn sm" data-test="${esc(c.intervention)}" ${d.summary.replayable?"":"disabled title='Run has no program to replay'"}>${c.test?"Re-test":"Run test"}</button>`:`<button class="btn sm" data-copy="${esc(c.intervention)}">Copy command</button>`}</td></tr>`).join("")}
  </tbody></table></div><p class="sub" style="font-size:12.5px;margin-top:8px">A test replays the run with the item removed (tool results come from the recording; new tool calls are stubbed, so nothing real is re-sent) and compares how often the target action happens.</p></section></div></div>`;
  el.querySelectorAll(".picker button").forEach(b=>b.onclick=()=>location.hash=base+"/why/"+encodeURIComponent(b.dataset.id));$("#pick-sel").onchange=e=>location.hash=base+"/why/"+encodeURIComponent(e.target.value);
  el.querySelectorAll("[data-node]").forEach(s=>s.onclick=()=>openNode(d,s.dataset.node));$("#open-act").onclick=()=>openNode(d,sel);
- el.querySelectorAll("[data-copy]").forEach(b=>b.onclick=()=>{const cmd=`causeway test ${d.path||"runs/"+d.run_id} --remove '${b.dataset.copy}' --target '${$("#target").value}' --n 30`;navigator.clipboard?.writeText(cmd).then(()=>toast("Command copied"),()=>prompt("Command",cmd))});
- el.querySelectorAll("[data-test]").forEach(b=>b.onclick=async()=>{b.disabled=true;b.textContent="Replaying…";try{const r=await getJSON("api/runs/"+encodeURIComponent(d.run_id)+"/tests",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({intervention:b.dataset.test,target:$("#target").value,n:30})});
+ el.querySelectorAll("[data-copy]").forEach(b=>b.onclick=()=>{const cmd=`causeway test ${d.path||"runs/"+d.run_id} --remove '${b.dataset.copy}' --target '${$("#target").value}' --n 20 --n-max 160`;navigator.clipboard?.writeText(cmd).then(()=>toast("Command copied"),()=>prompt("Command",cmd))});
+ const fc=$("#find-cause");if(fc)fc.onclick=async()=>{fc.disabled=true;fc.textContent="Replaying…";try{const r=await getJSON("api/runs/"+encodeURIComponent(d.run_id)+"/attribute",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({target:$("#target").value,n:10,n_max:80})});
+  toast(r.summary,9000);delete DATA.details[d.run_id];await loadWorkspace();render()}catch(e){toast("Attribution failed: "+e.message);fc.disabled=false;fc.textContent="Find the cause"}};
+ el.querySelectorAll("[data-test]").forEach(b=>b.onclick=async()=>{b.disabled=true;b.textContent="Replaying…";try{const r=await getJSON("api/runs/"+encodeURIComponent(d.run_id)+"/tests",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({intervention:b.dataset.test,target:$("#target").value,n:20,n_max:160})});
   toast(`${r.verdict}: effect ${sgn(r.effect)}`);delete DATA.details[d.run_id];await loadWorkspace();render()}catch(e){toast("Test failed: "+e.message);b.disabled=false;b.textContent="Run test"}})}
 
 function stepHTML(d,id){const x=d.nodes.find(z=>z.id===id);return `<span class="step" data-node="${esc(id)}" style="${x.trust==="untrusted"&&x.type==="input"?"border-color:var(--high)":""}"><span class="ty">${TYPE[x.type]} · ${esc(x.agent)}</span>${esc(trunc(short(x.label),26))}</span>`}
@@ -301,19 +321,19 @@ function openNode(d,id){const n=d.nodes.find(x=>x.id===id);if(!n)return;const by
  const ins=d.edges.filter(e=>e.dst===id&&e.evidence!=="tested"),outs=d.edges.filter(e=>e.src===id&&e.evidence!=="tested");
  const link=x=>`<a href="#" data-n="${esc(x.id)}">${esc(trunc(short(x.label),40))}</a> <span class="sub">${esc(x.agent)}</span>`;
  let body="";
- if(n.type==="decision"){body=`<dl class="kv"><dt>model</dt><dd>${esc(n.model)}</dd><dt>purpose</dt><dd>${esc(n.purpose||"–")}</dd><dt>took</dt><dd>${ms(n.duration_ms)}</dd>${n.usage&&n.usage.input_tokens!=null?`<dt>tokens</dt><dd>${n.usage.input_tokens} in · ${n.usage.output_tokens} out${n.usage.estimated?" (estimated)":""}</dd>`:""}<dt>status</dt><dd>${esc(n.status||"ok")}</dd></dl>
+ if(n.type==="decision"){body=`<dl class="kv"><dt>model</dt><dd>${esc(n.model)}</dd><dt>purpose</dt><dd>${esc(n.purpose||"–")}</dd><dt>took</dt><dd>${ms(n.duration_ms)}</dd>${n.usage&&n.usage.input_tokens!=null?`<dt>tokens</dt><dd>${n.usage.input_tokens} in · ${n.usage.output_tokens} out${n.usage.estimated?" (estimated)":""}</dd>`:""}<dt>status</dt><dd>${esc(n.status||"ok")}</dd>${n.context_mode?`<dt>context</dt><dd>${n.context_mode==="exact"?"exact (from the recorded request)":"reconstructed (request was hashed)"}</dd>`:""}</dl>
   <h3 style="margin-top:14px">What it saw (${n.context.length})</h3>${n.context.map(c=>`<div class="row" style="margin:3px 0">${c.node&&by[c.node]?link(by[c.node]):esc(c.source)} ${c.trust==="untrusted"?`<span class="pill p-untrusted">untrusted</span>`:""}</div>`).join("")}
   ${n.ablated&&n.ablated.length?`<p class="sub">Removed by intervention: ${n.ablated.length}</p>`:""}<h3 style="margin-top:14px">What it produced</h3><pre>${esc(n.output)}</pre>`}
- else if(n.type==="action"){const A=d.actions[id];body=`<dl class="kv"><dt>tool</dt><dd>${esc(n.tool)}</dd><dt>took</dt><dd>${ms(n.duration_ms)}</dd><dt>status</dt><dd>${esc(n.status)}</dd><dt>executed</dt><dd>${esc(n.mode)}</dd>${n.sensitive?`<dt>sensitive</dt><dd>yes</dd>`:""}</dl>
+ else if(n.type==="action"){const A=d.actions[id];body=`<dl class="kv"><dt>tool</dt><dd>${esc(n.tool)}</dd><dt>took</dt><dd>${ms(n.duration_ms)}</dd><dt>status</dt><dd>${esc(n.status)}</dd><dt>executed</dt><dd>${esc(n.mode)}</dd>${n.sensitive?`<dt>sensitive</dt><dd>yes</dd>`:""}${n.policy&&n.policy.decision?`<dt>Tracekit policy</dt><dd>${esc(n.policy.decision)}${n.policy.rule_ids&&n.policy.rule_ids.length?" ("+esc(n.policy.rule_ids.join(", "))+")":""}</dd>`:""}${n.guard?`<dt>guard</dt><dd>${esc(n.guard.verdict)}${n.guard.alerts&&n.guard.alerts.length?": "+esc(n.guard.alerts.map(a=>a.title).join("; ")):""}</dd>`:""}</dl>
   <h3 style="margin-top:14px">Arguments</h3><pre>${esc(JSON.stringify(n.args,null,2))}</pre><h3>Result</h3><pre>${esc(n.result)}</pre>${A?`<a class="btn" href="${base}/why/${encodeURIComponent(id)}">Why did this happen? →</a>`:""}`}
  else{body=`<dl class="kv"><dt>${n.type==="message"?"channel":"source"}</dt><dd>${esc(n.type==="message"?n.agent+" → "+n.to:n.source||n.label)}</dd><dt>trust</dt><dd>${esc(n.trust)}</dd></dl><h3 style="margin-top:14px">Content</h3><pre>${esc(n.content)}</pre>
   ${n.type==="input"?`<a class="btn" href="${base}/graph/${encodeURIComponent(id)}">Show what it reached →</a>`:""}`}
  $("#drawer").innerHTML=`<button class="btn sm x" id="dx">Close</button><div class="sub" style="font-size:12px">${TYPE[n.type]} · ${esc(n.agent)} · event #${n.seq}</div><h2 style="font-size:17px;margin:2px 0 12px;padding-right:60px">${esc(n.label)}</h2>${body}
  ${ins.length?`<h3 style="margin-top:16px">Came from</h3>${ins.map(e=>`<div style="margin:3px 0">${link(by[e.src])} <span class="sub" style="font-size:12px">${esc(e.kind)}${e.evidence==="inferred"?" · inferred":""}</span></div>`).join("")}`:""}
  ${outs.length?`<h3 style="margin-top:16px">Led to</h3>${outs.map(e=>`<div style="margin:3px 0">${link(by[e.dst])} <span class="sub" style="font-size:12px">${esc(e.kind)}${e.evidence==="inferred"?" · inferred":""}</span></div>`).join("")}`:""}
- <h3 style="margin-top:16px">Record</h3><dl class="kv mono" style="font-size:11.5px"><dt>time</dt><dd>${esc(n.ts)}</dd><dt>hash</dt><dd>${esc(n.hash)}</dd><dt>prev</dt><dd>${esc(n.prev)}</dd></dl>`;
+ <h3 style="margin-top:16px">Record</h3><dl class="kv mono" style="font-size:11.5px"><dt>time</dt><dd>${esc(n.ts)}</dd><dt>hash</dt><dd>${esc(n.hash)}</dd><dt>prev</dt><dd>${esc(n.prev)}</dd>${n.evidence?`<dt>Tracekit</dt><dd>${n.evidence.map(x=>`signed record #${esc(x.seq)} ${esc(x.type||"")} <span class="sub">${esc(String(x.hash).slice(0,16))}…</span>`).join("<br>")}</dd>`:""}</dl>`;
  const dr=$("#drawer");dr.classList.add("open");dr.setAttribute("aria-hidden","false");dr.scrollTop=0;$("#dx").onclick=closeDrawer;
  dr.querySelectorAll("[data-n]").forEach(a=>a.onclick=ev=>{ev.preventDefault();openNode(d,a.dataset.n)})}
 
-(async()=>{try{await loadWorkspace()}catch(e){$("#app").innerHTML=`<div class="card">Could not reach the server: ${esc(e.message)}</div>`;return}render()})();
+(async()=>{try{await loadWorkspace()}catch(e){$("#app").innerHTML=`<div class="card">Could not reach the server: ${esc(e.message)}</div>`;return}render();startLive()})();
 </script></body></html>

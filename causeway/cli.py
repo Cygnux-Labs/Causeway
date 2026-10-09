@@ -10,7 +10,7 @@ import tempfile
 from .core import load_run, verify
 from .evals import influence_index, influence_matrix, list_runs, structure
 from .graph import build_graph, taint, target_hits
-from .replay import counterfactual, decision_test, diff_runs, load_system, replay
+from .replay import attribute, counterfactual, decision_test, diff_runs, load_system, replay
 from .view import render_html, render_workspace
 
 
@@ -21,11 +21,14 @@ def _p(*a):
 def _fmt_test(r):
     if r.get("p_with") is None:
         return (f"  remove {r['intervention']:<28} target {r['target']:<40} "
-                f"changed in {r['effect']:.0%} of calls [{r['ci'][0]:.2f}, {r['ci'][1]:.2f}] n={r['n']}  "
+                f"changed in {r['effect']:+.0%} more calls than noise ({r.get('noise') or 0:.0%}) "
+                f"[{r['ci'][0]:+.2f}, {r['ci'][1]:+.2f}] n={r['n']}  "
                 f"{r['verdict'].upper()}")
     return (f"  remove {r['intervention']:<28} target {r['target']:<40} "
             f"P(with)={r['p_with']:.2f} P(without)={r['p_without']:.2f} "
-            f"effect={r['effect']:+.2f} [{r['ci'][0]:+.2f}, {r['ci'][1]:+.2f}] n={r['n']}  {r['verdict'].upper()}")
+            f"effect={r['effect']:+.2f} [{r['ci'][0]:+.2f}, {r['ci'][1]:+.2f}] n={r['n']}  {r['verdict'].upper()}"
+            + (f" ({r['role']})" if r.get("role") else "")
+            + (f" (target reproduced in {r['p_with']:.0%} of replays; try n={r['n_needed']})" if r.get("n_needed") else ""))
 
 
 def cmd_demo(a):
@@ -119,12 +122,34 @@ def cmd_test(a):
     run = load_run(a.run)
     system = load_system(a.system) if a.system else None
     if a.decision is not None:
-        r = decision_test(run, a.decision, a.remove, n=a.n, system=system, contains=a.contains)
+        models = None
+        if a.anthropic:  # re-send calls recorded by the Anthropic adapter
+            from anthropic import Anthropic
+            from .adapters.anthropic import replay_model
+            fn = replay_model(Anthropic().messages)
+            models = {e["model"]: fn for e in run.of_type("decision")}
+        r = decision_test(run, a.decision, a.remove, n=a.n, system=system, models=models, contains=a.contains,
+                          n_max=a.n_max)
     else:
         if not a.target:
             raise SystemExit("--target is required unless --decision is given")
-        r = counterfactual(run, a.remove, a.target, n=a.n, system=system, live_tools=a.live_tools)
+        r = counterfactual(run, a.remove, a.target, n=a.n, system=system, live_tools=a.live_tools, n_max=a.n_max)
     _p(json.dumps(r, indent=2) if a.json else _fmt_test(r))
+
+
+def cmd_attribute(a):
+    run = load_run(a.run)
+    r = attribute(run, a.target, a.suspect or None, n=a.n, n_max=a.n_max,
+                  system=load_system(a.system) if a.system else None, workers=a.workers,
+                  size_roles=not a.no_roles)
+    if a.json:
+        _p(json.dumps(r, indent=2, default=str))
+        return
+    _p(f"suspects: {', '.join(r['suspects'])}")
+    for t in r["tests"]:
+        _p(_fmt_test(t))
+    _p(f"\n{r['summary']}")
+    _p(f"({r['program_runs']} program runs, {len(r['tests'])} tests, corrected for {r['family']})")
 
 
 def cmd_matrix(a):
@@ -142,9 +167,48 @@ def cmd_replay(a):
 
 
 def cmd_record(a):
+    from .guard import Guard, webhook
     sysm = load_system(a.system)
-    r = sysm.run(seed=a.seed, out_dir=a.out)
+    guard = None
+    if a.guard != "off":
+        guard = Guard(a.guard, on_alert=_print_and(webhook(a.webhook) if a.webhook else None))
+    r = sysm.run(seed=a.seed, out_dir=a.out, guard=guard)
     _p(r.path)
+
+
+def _print_and(then):
+    def on_alert(al):
+        verb = "BLOCKED" if al.get("blocked") else al["severity"].upper()
+        _p(f"  [{verb}] {al['agent']}.{al['tool']} #{al['seq']}: {al['title']}. {al.get('detail', '')}")
+        if then:
+            then(al)
+    return on_alert
+
+
+def cmd_watch(a):
+    """Follow a runs folder in the terminal: print new alerts as runs are recorded."""
+    import time
+    from .server import Store
+    store = Store(a.root, None, webhook=a.webhook)
+    store.watch(a.interval)
+    _p(f"watching {a.root} (Ctrl-C to stop)")
+    last = 0
+    try:
+        while True:
+            with store.cond:
+                store.cond.wait_for(lambda: store.counter > last, timeout=1)
+            for i, m in store.since(last):
+                last = i
+                if m["type"] != "run":
+                    continue
+                state = "finished" if m["finished"] else "running"
+                if m["alerts"] or m["finished"]:
+                    _p(f"{m['run_id']}: {m['events']} events, {state}")
+                for al in m["alerts"]:
+                    _p(f"  [{al['severity'].upper()}] {al.get('agent') or ''}.{al.get('tool') or ''} "
+                       f"#{al.get('seq')}: {al['title']}. {al.get('detail') or ''}")
+    except KeyboardInterrupt:
+        pass
 
 
 def cmd_view(a):
@@ -165,9 +229,10 @@ def cmd_report(a):
 def cmd_serve(a):
     from .server import serve
     token = a.token or os.environ.get("CAUSEWAY_TOKEN")
-    httpd, _ = serve(a.root, a.host, a.port, token, a.allow_program or [])
+    httpd, _ = serve(a.root, a.host, a.port, token, a.allow_program or [], webhook=a.webhook)
     _p(f"Causeway on http://{a.host}:{a.port}  (runs: {a.root})")
     _p(f"  ingest: {'POST /v1/ingest with Bearer token' if token else 'disabled (set --token or CAUSEWAY_TOKEN)'}")
+    _p(f"  live: the app updates as runs are recorded{'; high alerts POSTed to ' + a.webhook if a.webhook else ''}")
     _p(f"  replay from the UI: {', '.join(a.allow_program) if a.allow_program else 'disabled (--allow-program module:SYSTEM)'}")
     if a.host not in ("127.0.0.1", "localhost", "::1"):
         _p("  WARNING: the app and read API have no auth; keep them behind a trusted network or proxy.")
@@ -175,6 +240,33 @@ def cmd_serve(a):
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass
+
+
+def cmd_import(a):
+    from .importers import tracekit as tk
+    if a.list:
+        recs = tk.read_ledger(tk.ledger_path(a.src))
+        for rid, n in tk.runs_in(recs):
+            _p(f"{rid}  ({n} records)")
+        return 0
+    paths = tk.import_ledger(a.src, a.out, run=a.run, untrusted_tools=a.untrusted_tool or ("*",),
+                             trusted_tools=a.trusted_tool or tk.SUBAGENT_TOOLS, sensitive_tools=a.sensitive or ())
+    for p in paths:
+        run = load_run(p)
+        meta = run.start.get("meta") or {}
+        sig = meta.get("signatures") or {}
+        decs = run.of_type("decision")
+        exact = sum(1 for d in decs if d.get("context_mode") == "exact")
+        _p(f"{p}: {len(run.events)} events, {len(decs)} model calls ({exact} with exact context), "
+           f"{len(run.of_type('action'))} tool calls, content capture: {meta.get('content_capture')}")
+        _p("  signatures: " + ("verified" if sig.get("verified") else "FAILED: " + "; ".join(sig.get("problems", []))
+                               if sig.get("verified") is False else "; ".join(sig.get("problems", [])) or "not checked"))
+        if meta.get("content_capture") == "hashed":
+            _p("  content was hashed by Tracekit: argument provenance cannot trace values "
+               "(set content_capture: full for untrusted tools)")
+        if not decs:
+            _p("  no model calls recorded: enable Tracekit autotrace, the SDK or the model proxy for decisions")
+    return 0
 
 
 def cmd_index(a):
@@ -198,6 +290,9 @@ def main(argv=None):
 
     p = sp.add_parser("record", help="run a System (module:ATTR) and record it")
     p.add_argument("system"); p.add_argument("--out", default="runs"); p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--guard", choices=("off", "alert", "block"), default="off",
+                   help="check sensitive tool calls before they run")
+    p.add_argument("--webhook", help="POST high alerts here (with --guard)")
     p.set_defaults(f=cmd_record)
 
     p = sp.add_parser("verify", help="check the hash chain and blobs"); p.add_argument("run"); p.set_defaults(f=cmd_verify)
@@ -214,8 +309,19 @@ def main(argv=None):
     p.add_argument("run"); p.add_argument("--remove", required=True); p.add_argument("--target")
     p.add_argument("--decision", type=int, help="test one recorded model call (seq) instead of re-running the program")
     p.add_argument("--contains", help="with --decision: measure P(output contains this text)")
+    p.add_argument("--anthropic", action="store_true",
+                   help="with --decision: re-send a call recorded by the Anthropic adapter (needs ANTHROPIC_API_KEY)")
     p.add_argument("--n", type=int, default=30); p.add_argument("--system"); p.add_argument("--live-tools", action="store_true")
+    p.add_argument("--n-max", type=int, help="sequential: keep doubling n up to this until the verdict is decisive")
     p.add_argument("--json", action="store_true"); p.set_defaults(f=cmd_test)
+
+    p = sp.add_parser("attribute", help="which inputs caused an action: group test first, then narrow down")
+    p.add_argument("run"); p.add_argument("--target", required=True)
+    p.add_argument("--suspect", action="append", help="intervention spec (default: untrusted inputs upstream)")
+    p.add_argument("--n", type=int, default=10); p.add_argument("--n-max", type=int, default=80)
+    p.add_argument("--workers", type=int, default=1, help="parallel replays")
+    p.add_argument("--no-roles", action="store_true", help="skip sizing each cause (primary vs contributing): cheaper")
+    p.add_argument("--system"); p.add_argument("--json", action="store_true"); p.set_defaults(f=cmd_attribute)
 
     p = sp.add_parser("matrix", help="test every channel and input against targets")
     p.add_argument("run"); p.add_argument("--target", action="append", required=True); p.add_argument("--n", type=int, default=20)
@@ -234,7 +340,22 @@ def main(argv=None):
     p.add_argument("root"); p.add_argument("--host", default="127.0.0.1"); p.add_argument("--port", type=int, default=7788)
     p.add_argument("--token", help="bearer token for /v1/ingest (or CAUSEWAY_TOKEN)")
     p.add_argument("--allow-program", action="append", help="System spec the UI may replay (repeatable)")
+    p.add_argument("--webhook", help="POST each new high alert here as JSON (Slack-compatible)")
     p.set_defaults(f=cmd_serve)
+
+    p = sp.add_parser("watch", help="follow a runs folder in the terminal and print new alerts live")
+    p.add_argument("root"); p.add_argument("--webhook"); p.add_argument("--interval", type=float, default=0.5)
+    p.set_defaults(f=cmd_watch)
+
+    p = sp.add_parser("import", help="import runs from another system (tracekit)")
+    p.add_argument("format", choices=("tracekit",))
+    p.add_argument("src", help="Tracekit home, ledger directory or ledger.jsonl")
+    p.add_argument("--run", help="Tracekit run id (default: every run in the ledger)")
+    p.add_argument("--out", default="runs"); p.add_argument("--list", action="store_true", help="list runs and exit")
+    p.add_argument("--untrusted-tool", action="append", help="glob of tools whose results are untrusted (default *)")
+    p.add_argument("--trusted-tool", action="append", help="glob of tools whose results are trusted")
+    p.add_argument("--sensitive", action="append", help="tool to treat as sensitive (repeatable)")
+    p.set_defaults(f=cmd_import)
 
     p = sp.add_parser("index", help="influence index across runs")
     p.add_argument("root"); p.add_argument("--target", action="append"); p.add_argument("--top", type=int, default=20)
