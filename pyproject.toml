@@ -33,7 +33,7 @@ Issues = "https://github.com/Cygnux-Labs/Causeway/issues"
 causeway = "causeway.cli:main"
 
 [tool.setuptools]
-packages = ["causeway", "causeway.adapters"]
+packages = ["causeway", "causeway.adapters", "causeway.importers"]
 
 [tool.setuptools.package-data]
 causeway = ["app.html"]

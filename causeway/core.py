@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import secrets
+import threading
 import time
 import urllib.request
 from dataclasses import dataclass, field
@@ -177,21 +178,25 @@ def referenced_refs(ev: Dict[str, Any]) -> List[str]:
 
 class HttpSink:
     """Ships events and their blobs to a `causeway serve` collector (POST /v1/ingest).
-    Batches; call flush() (Runtime.finish does) to send the rest. Raises on HTTP errors so a
-    lost batch is visible to the caller rather than silently dropped."""
+    Batches, but sends at once after every tool call and when `interval` seconds have passed, so the
+    collector sees a running system live. Call flush() (Runtime.finish does) to send the rest.
+    Raises on HTTP errors so a lost batch is visible to the caller rather than silently dropped."""
 
-    def __init__(self, url: str, token: str, batch: int = 50, timeout: float = 10.0):
+    def __init__(self, url: str, token: str, batch: int = 50, timeout: float = 10.0, interval: float = 1.0):
         self.url = url.rstrip("/") + "/v1/ingest"
         self.token = token
         self.batch = batch
         self.timeout = timeout
+        self.interval = interval
         self._events: List[Dict[str, Any]] = []
         self._blobs: Dict[str, Any] = {}
+        self._last = time.monotonic()
 
     def write(self, ev: Dict[str, Any], blobs: Dict[str, Any]) -> None:
         self._events.append(ev)
         self._blobs.update(blobs)
-        if len(self._events) >= self.batch:
+        if (len(self._events) >= self.batch or ev.get("type") in ("action", "run.end")
+                or time.monotonic() - self._last >= self.interval):
             self.flush()
 
     def flush(self) -> None:
@@ -204,6 +209,7 @@ class HttpSink:
             if r.status >= 300:
                 raise RuntimeError(f"ingest failed: HTTP {r.status}")
         self._events, self._blobs = [], {}
+        self._last = time.monotonic()
 
 
 @dataclass
@@ -259,7 +265,9 @@ class Runtime:
         live_tools: bool = True,
         meta: Optional[Dict[str, Any]] = None,
         sensitive_tools: Sequence[str] = (),
+        untrusted_tools: Sequence[str] = (),
         sink: Optional[HttpSink] = None,
+        guard: Optional[Any] = None,
     ):
         self.models = dict(models)
         self.tools = dict(tools or {})
@@ -276,15 +284,21 @@ class Runtime:
         self._tape_seen: Dict[tuple, int] = {}
         self.path: Optional[str] = None
         self.sensitive_tools = set(sensitive_tools)
+        self.untrusted_tools = set(untrusted_tools)
         self.sink = sink
+        self.guard = guard  # causeway.guard.Guard: checks sensitive tool calls before they run
+        self.alerts: List[Dict[str, Any]] = []  # raised by the guard during this run
         self._pending_blobs: Dict[str, Any] = {}
+        # agents may run in threads: every write to the log, blob store, mail and counters takes this lock
+        self._lock = threading.RLock()
         if out_dir:
             self.path = os.path.join(out_dir, self.run_id)
             os.makedirs(os.path.join(self.path, "blobs"), exist_ok=True)
             open(os.path.join(self.path, "events.jsonl"), "w").close()
         self._emit("run", "run.start", program=program, seed=seed, interventions=self.interventions,
                    models=sorted(self.models), tools=sorted(self.tools), meta=meta or {},
-                   sensitive_tools=sorted(self.sensitive_tools))
+                   sensitive_tools=sorted(self.sensitive_tools), untrusted_tools=sorted(self.untrusted_tools),
+                   guard=self.guard.describe() if self.guard is not None else None)
         self.task_ref: Optional[Ref] = None
         if task is not None:
             self.task_ref = self._input("run", task, source="task", trust="trusted", kind="task")
@@ -292,6 +306,10 @@ class Runtime:
     # -- storage
     def _blob(self, value: Any) -> str:
         ref = content_hash(value)
+        with self._lock:
+            return self._store_blob(ref, value)
+
+    def _store_blob(self, ref: str, value: Any) -> str:
         if ref not in self.blobs:
             self.blobs[ref] = value
             if self.sink is not None:
@@ -303,6 +321,10 @@ class Runtime:
         return ref
 
     def _emit(self, agent: str, etype: str, **body: Any) -> Dict[str, Any]:
+        with self._lock:
+            return self._emit_locked(agent, etype, body)
+
+    def _emit_locked(self, agent: str, etype: str, body: Dict[str, Any]) -> Dict[str, Any]:
         ev = {"schema": SCHEMA, "seq": len(self.events), "id": secrets.token_hex(16), "prev_hash": self._prev,
               "ts": _now(), "run_id": self.run_id, "agent": agent, "type": etype}
         ev.update(body)
@@ -329,12 +351,13 @@ class Runtime:
 
     # -- public
     def agent(self, name: str, *, parent: Optional[str] = None, role: str = "") -> "Agent":
-        if name in self._agents:
-            return self._agents[name]
-        self._emit(name, "agent.start", parent=parent, role=role)
-        a = Agent(self, name)
-        self._agents[name] = a
-        return a
+        with self._lock:
+            if name in self._agents:
+                return self._agents[name]
+            self._emit(name, "agent.start", parent=parent, role=role)
+            a = Agent(self, name)
+            self._agents[name] = a
+            return a
 
     def finish(self, outcome: Any = None) -> Run:
         self._emit("run", "run.end", outcome=outcome)
@@ -352,6 +375,12 @@ class Agent:
         self.name = name
         self._n_decisions = 0
 
+    def _next_seed(self) -> int:
+        with self.rt._lock:
+            seed = derive_seed(self.rt.seed, self.name, self._n_decisions)
+            self._n_decisions += 1
+            return seed
+
     def observe(self, value: Any, *, source: str, trust: str = "untrusted") -> Ref:
         """Bring an outside value into this agent's world (file, web page, email, user message)."""
         return self.rt._input(self.name, value, source=source, trust=trust)
@@ -363,8 +392,7 @@ class Agent:
         context = [c for c in context if c is not None]
         kept = [c for c in context if not rt._ablated(c)]
         ablated = [c.ref for c in context if rt._ablated(c)]
-        seed = derive_seed(rt.seed, self.name, self._n_decisions)
-        self._n_decisions += 1
+        seed = self._next_seed()
         params = params or {}
         if model not in rt.models:
             raise KeyError(f"model {model!r} not registered")
@@ -401,18 +429,28 @@ class Agent:
         return Ref(out, output, "output", self.name, purpose, trust, ev["id"])
 
     def act(self, tool: str, args: Optional[dict] = None, *, decision: Optional[Ref] = None,
-            sensitive: Optional[bool] = None) -> Ref:
-        """Run a tool. Under replay, results come from the tape when the call matches a recorded one."""
+            sensitive: Optional[bool] = None, untrusted: Optional[bool] = None) -> Ref:
+        """Run a tool. Under replay, results come from the tape when the call matches a recorded one.
+
+        With a guard on the runtime, a sensitive call is checked first and may be blocked: the tool
+        does not run and the caller gets {"error": "blocked by causeway guard: ..."} back.
+        `untrusted=True` (or the tool listed in the runtime's untrusted_tools) records the result as
+        untrusted content, like observe(), so later decisions that read it are tainted."""
         rt = self.rt
         args = args or {}
         args_ref = rt._blob(args)
+        is_sensitive = bool(sensitive) if sensitive is not None else tool in rt.sensitive_tools
         mode = "live"
         t0 = time.perf_counter()
         result: Any = _MISSING
-        if rt.tape is not None:
+        check = rt.guard.check(rt, self.name, tool, args, decision, is_sensitive) if rt.guard is not None else None
+        if check is not None and check.blocked:
+            result, mode = {"error": "blocked by causeway guard: " + check.reason}, "blocked"
+        elif rt.tape is not None:
             key = (self.name, tool, args_ref)
-            n = rt._tape_seen.get(key, 0)
-            rt._tape_seen[key] = n + 1
+            with rt._lock:
+                n = rt._tape_seen.get(key, 0)
+                rt._tape_seen[key] = n + 1
             result = rt.tape.get(key + (n,))
             mode = "tape"
         if result is _MISSING:
@@ -425,27 +463,50 @@ class Agent:
             else:
                 mode = "stub"
                 result = {"_unrecorded": True, "tool": tool}
-        status = "error" if isinstance(result, dict) and "error" in result else "ok"
+        status = "blocked" if mode == "blocked" else _status(result)
         res_ref = rt._blob(result)
+        extra = {"guard": check.record()} if check is not None and check.alerts else {}
         ev = rt._emit(self.name, "action", tool=tool, args_ref=args_ref, result_ref=res_ref,
                       decision=decision.event_id if decision else None, status=status, mode=mode,
-                      sensitive=bool(sensitive) if sensitive is not None else tool in rt.sensitive_tools,
-                      duration_ms=round((time.perf_counter() - t0) * 1000, 3))
+                      sensitive=is_sensitive, duration_ms=round((time.perf_counter() - t0) * 1000, 3), **extra)
+        if check is not None:
+            check.notify(rt, ev)
         trust = decision.trust if decision else "trusted"
-        return Ref(res_ref, result, "result", self.name, tool, trust, ev["id"])
+        ref = Ref(res_ref, result, "result", self.name, tool, trust, ev["id"])
+        if mode != "blocked" and (untrusted if untrusted is not None else tool in rt.untrusted_tools):
+            # same content as the action's result, so the graph links action -> input (same-content)
+            ref = rt._input(self.name, result, source=f"tool:{tool}", trust="untrusted")
+        return ref
+
+    def check(self, tool: str, args: Optional[dict] = None, *, decision: Optional[Ref] = None,
+              sensitive: Optional[bool] = None) -> Any:
+        """Ask the runtime's guard about a tool call your own code is about to execute (adapters use
+        this). Returns a causeway.guard.Check, or None when the runtime has no guard."""
+        rt = self.rt
+        if rt.guard is None:
+            return None
+        is_sensitive = bool(sensitive) if sensitive is not None else tool in rt.sensitive_tools
+        return rt.guard.check(rt, self.name, tool, args or {}, decision, is_sensitive)
 
     def record_action(self, tool: str, args: Optional[dict], result: Any, *, decision: Optional[Ref] = None,
                       sensitive: Optional[bool] = None, duration_ms: Optional[float] = None,
-                      status: Optional[str] = None) -> Ref:
-        """Record a tool call your own code executed (adapters use this)."""
+                      status: Optional[str] = None, check: Any = None) -> Ref:
+        """Record a tool call your own code executed (adapters use this). Pass the `check` you got
+        from check() so the guard's verdict is stored with the action; a blocked check records the
+        call as blocked."""
         rt = self.rt
         args_ref, res_ref = rt._blob(args or {}), rt._blob(result)
+        blocked = check is not None and check.blocked
         if status is None:
-            status = "error" if isinstance(result, dict) and "error" in result else "ok"
+            status = "blocked" if blocked else _status(result)
+        extra = {"guard": check.record()} if check is not None and check.alerts else {}
         ev = rt._emit(self.name, "action", tool=tool, args_ref=args_ref, result_ref=res_ref,
-                      decision=decision.event_id if decision else None, status=status, mode="live",
+                      decision=decision.event_id if decision else None, status=status,
+                      mode="blocked" if blocked else "live",
                       sensitive=bool(sensitive) if sensitive is not None else tool in rt.sensitive_tools,
-                      duration_ms=round(duration_ms, 3) if duration_ms is not None else None)
+                      duration_ms=round(duration_ms, 3) if duration_ms is not None else None, **extra)
+        if check is not None:
+            check.notify(rt, ev)
         return Ref(res_ref, result, "result", self.name, tool, decision.trust if decision else "trusted", ev["id"])
 
     def send(self, to: str, content: Any, *, decision: Optional[Ref] = None) -> Ref:
@@ -457,11 +518,18 @@ class Agent:
         if decision is None and isinstance(content, Ref) and content.kind == "output":
             decision = content
         ref = rt._blob(value)
-        ev = rt._emit(self.name, "message", to=to, ref=ref, decision=decision.event_id if decision else None,
-                      trust=trust)
-        r = Ref(ref, value, "message", to, f"{self.name}->{to}", trust, ev["id"])
-        rt._mail.setdefault(to, []).append(r)
+        with rt._lock:
+            ev = rt._emit(self.name, "message", to=to, ref=ref, decision=decision.event_id if decision else None,
+                          trust=trust)
+            r = Ref(ref, value, "message", to, f"{self.name}->{to}", trust, ev["id"])
+            rt._mail.setdefault(to, []).append(r)
         return r
 
     def inbox(self) -> List[Ref]:
-        return list(self.rt._mail.get(self.name, []))
+        with self.rt._lock:
+            return list(self.rt._mail.get(self.name, []))
+
+
+def _status(result: Any) -> str:
+    """A tool result reads as an error when it is {"error": <something>}; {"error": None} is a success."""
+    return "error" if isinstance(result, dict) and result.get("error") not in (None, "", False) else "ok"

@@ -15,8 +15,21 @@ def _pretty(v: Any, limit: int = 4000) -> str:
     return s if len(s) <= limit else s[:limit] + "\n…"
 
 
+def _evidence(run: Run) -> Dict[str, Any]:
+    """Signed Tracekit records behind each event, when the run was imported from Tracekit."""
+    p = os.path.join(run.path, "tracekit-map.json") if run.path else ""
+    if not p or not os.path.exists(p):
+        return {}
+    try:
+        with open(p, encoding="utf-8") as f:
+            return json.load(f).get("events") or {}
+    except (OSError, ValueError):
+        return {}
+
+
 def run_detail(run: Run) -> Dict[str, Any]:
     inv = investigation(run)
+    evidence = _evidence(run)
     g = inv["graph"]
     agents: List[Dict[str, Any]] = []
     for ev in run.of_type("agent.start"):
@@ -35,7 +48,9 @@ def run_detail(run: Run) -> Dict[str, Any]:
                              "label": n["label"], "trust": n.get("trust", "trusted"), "kind": n.get("kind"),
                              "to": n.get("to"), "hash": ev["hash"], "prev": ev["prev_hash"], "ts": ev["ts"],
                              "duration_ms": ev.get("duration_ms"), "status": ev.get("status"),
-                             "sensitive": ev.get("sensitive", False), "mode": ev.get("mode")}
+                             "sensitive": ev.get("sensitive", False), "mode": ev.get("mode"),
+                             "evidence": evidence.get(ev["id"]), "policy": ev.get("policy"),
+                             "context_mode": ev.get("context_mode")}
         if n["type"] == "decision":
             d.update(model=ev["model"], purpose=ev.get("purpose"), usage=ev.get("usage") or {},
                      context=[{"source": c["source"] or c["kind"], "kind": c["kind"], "trust": c["trust"],
@@ -43,7 +58,8 @@ def run_detail(run: Run) -> Dict[str, Any]:
                               for c in ev["context"]],
                      ablated=ev.get("ablated", []), output=_pretty(run.value(ev["output"])))
         elif n["type"] == "action":
-            d.update(args=run.value(ev["args_ref"]), result=_pretty(run.value(ev["result_ref"])), tool=ev["tool"])
+            d.update(args=run.value(ev["args_ref"]), result=_pretty(run.value(ev["result_ref"])), tool=ev["tool"],
+                     guard=ev.get("guard"))
         else:
             d.update(content=_pretty(run.value(ev.get("ref"))), source=ev.get("source"))
         nodes.append(d)
@@ -53,6 +69,7 @@ def run_detail(run: Run) -> Dict[str, Any]:
             "timeline": inv["timeline"], "nodes": nodes, "edges": edges, "actions": inv["actions"],
             "matrix": inv["matrix"], "channels": inv["channels"], "agents": agents,
             "critical_path": st["critical_path"], "tests": run.tests,
+            "source": (run.start.get("meta") or {}) if (run.start.get("meta") or {}).get("source") == "tracekit" else None,
             "outcome": run.events[-1].get("outcome") if run.events and run.events[-1]["type"] == "run.end" else None}
 
 
@@ -60,8 +77,11 @@ def app_data(paths: List[str]) -> Dict[str, Any]:
     ws = workspace(paths)
     details = {}
     for p in paths:
-        r = load_run(p)
-        details[r.run_id] = run_detail(r)
+        try:
+            r = load_run(p)
+            details[r.run_id] = run_detail(r)
+        except Exception:  # workspace() already reported it
+            continue
     ws["details"] = details
     return ws
 

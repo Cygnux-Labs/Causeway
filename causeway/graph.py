@@ -256,7 +256,11 @@ def _weight_context_edges(g: Graph, run: Run) -> None:
 
 
 def nodes_matching(g: Graph, spec: str) -> List[str]:
-    """Map an intervention spec to the nodes it would remove in the original run."""
+    """Map an intervention spec to the nodes it would remove in the original run. A group test
+    removes several specs at once; it is written "spec | spec | ...".
+    """
+    if " | " in spec:
+        return sorted({n for part in spec.split(" | ") for n in nodes_matching(g, part)})
     out = []
     for nid, n in g.nodes.items():
         ev = n["event"]

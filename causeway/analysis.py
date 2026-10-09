@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from typing import Any, Dict, List, Optional
 
 from .core import Run, canonical, load_run, verify
@@ -61,29 +62,41 @@ def atoms(args: Any) -> List[str]:
 def arg_provenance(run: Run, g: Graph, action_ev: Dict[str, Any]) -> List[Dict[str, Any]]:
     """For each argument value, which earlier inputs or tool results contained it verbatim.
     untrusted-only: only untrusted inputs carried it (the classic injection signature)
-    trusted:        some trusted input or tool result carried it
+    trusted:        some trusted input (the task included) or tool result carried it
     generated:      no earlier source; the model produced it"""
+    return value_provenance(run, run.value(action_ev["args_ref"]), action_ev["seq"])
+
+
+def value_provenance(run: Run, args: Any, before_seq: int) -> List[Dict[str, Any]]:
+    """arg_provenance for argument values that need not be recorded yet: the live guard calls this
+    before a tool runs, with before_seq past the end of the log."""
     rows = []
     untrusted_refs = {e["ref"] for e in run.of_type("input") if e.get("trust") == "untrusted"}
-    for a in atoms(run.value(action_ev["args_ref"])):
+    # a tool result is untrusted when its content was also recorded as untrusted input, or when the
+    # action itself is marked untrusted (e.g. a subagent's answer after it read untrusted content).
+    # Not every result downstream of untrusted content: a trusted tool's own output stays trusted.
+    hashed = (run.start.get("meta") or {}).get("content_capture") == "hashed"
+    texts = []
+    for ev in run.events:
+        if ev["seq"] >= before_seq:
+            break
+        if ev["type"] == "input":
+            texts.append((ev, _txt(run.value(ev["ref"])).lower(), ev.get("trust", "trusted"),
+                          "task" if ev.get("kind") == "task" else ev.get("source", "input")))
+        elif ev["type"] == "action" and ev.get("status") != "blocked":
+            # a tool result counts as untrusted if the same content was also recorded as untrusted input
+            untrusted = ev["result_ref"] in untrusted_refs or ev.get("trust") == "untrusted"
+            texts.append((ev, _txt(run.value(ev["result_ref"])).lower(),
+                          "untrusted" if untrusted else "trusted", ev["tool"]))
+    for a in atoms(args):
+        if hashed and a.startswith("sha256:"):  # a hash placeholder, not a value
+            rows.append({"value": a, "status": "hashed", "sources": []})
+            continue
         low = a.lower()
-        srcs = []
-        for n in g.nodes.values():
-            ev = n["event"]
-            if ev["seq"] >= action_ev["seq"]:
-                continue
-            if n["type"] == "input" and n.get("kind") != "task":
-                text, trust = _txt(run.value(ev["ref"])), ev.get("trust", "trusted")
-            elif n["type"] == "action":
-                # a tool result counts as untrusted if the same content was also recorded as untrusted input
-                text = _txt(run.value(ev["result_ref"]))
-                trust = "untrusted" if ev["result_ref"] in untrusted_refs else "trusted"
-            else:
-                continue
-            if low in text.lower():
-                srcs.append({"node": n["id"], "label": n["label"], "trust": trust})
+        srcs = [{"node": "ev:" + ev["id"], "label": label, "trust": trust}
+                for ev, text, trust, label in texts if low in text]
         if not srcs:
-            status = "generated"
+            status = "hashed" if hashed else "generated"  # with hashed capture there is no text to search
         elif all(s["trust"] == "untrusted" for s in srcs):
             status = "untrusted-only"
         else:
@@ -117,7 +130,8 @@ def intervention_for(node: Dict[str, Any]) -> Optional[str]:
 
 def candidates(run: Run, g: Graph, action_node: str) -> List[Dict[str, Any]]:
     """Every upstream input and message channel of an action, with what is known about it:
-    confirmed (tested, CI excludes 0), ruled-out (tested, no detectable effect), or untested."""
+    confirmed (tested, CI excludes 0), ruled-out (tested, any effect bounded below the minimum of
+    interest), inconclusive (tested, the interval is too wide to say), or untested."""
     ev = g.nodes[action_node]["event"]
     anc = g.ancestors(action_node, ("observed",))
     hit_cache: Dict[str, bool] = {}
@@ -154,21 +168,37 @@ def candidates(run: Run, g: Graph, action_node: str) -> List[Dict[str, Any]]:
         if best is None:
             status = "untested"
         elif best["verdict"] == "causal":
-            status = "confirmed"
+            status = "contributing" if _role(best) == "contributing" else "confirmed"
         elif best["verdict"] == "suppressive":
             status = "suppressive"
         elif best["verdict"] == "not-applied":
             status = "untested"
         else:
-            status = "ruled-out"
+            status = _settled(best)
         reuse = max((e.get("reuse", 0) for e in g.out_edges(nid, ("observed",))), default=0)
         rows.append({"node": nid, "label": node["label"], "kind": node["type"], "agent": node["agent"],
                      "trust": node.get("trust", "trusted"), "intervention": spec, "status": status,
+                     "role": _role(best) if status in ("confirmed", "contributing") and best.get("p_with") is not None
+                     else None,
                      "test": best, "reuse": reuse})
-    order = {"confirmed": 0, "suppressive": 1, "untested": 2, "ruled-out": 3}
+    order = {"confirmed": 0, "contributing": 1, "suppressive": 2, "inconclusive": 3, "untested": 4, "ruled-out": 5}
     rows.sort(key=lambda r: (order[r["status"]], -(r["test"]["effect"] if r["test"] else 0),
                              r["trust"] != "untrusted", -r["reuse"]))
     return rows
+
+
+def _role(t: Dict[str, Any]) -> str:
+    from .replay import role_for
+    return t.get("role") or role_for(t.get("p_with") or 0, t["ci"])
+
+
+def _settled(t: Dict[str, Any]) -> str:
+    """ruled-out or inconclusive, also for tests saved before the two were told apart."""
+    if t["verdict"] in ("ruled-out", "inconclusive"):
+        return t["verdict"]
+    lo, hi = t["ci"]
+    m = t.get("min_effect", 0.2)
+    return "ruled-out" if hi < m and lo > -m else "inconclusive"
 
 
 def lineage(g: Graph, action_node: str) -> List[List[str]]:
@@ -191,6 +221,9 @@ def alerts(run: Run, g: Graph) -> List[Dict[str, Any]]:
     problems = verify(run)
     if problems:
         out.append({"severity": "high", "title": "Log failed integrity check", "detail": problems[0], "node": None})
+    for e in (run.start.get("meta") or {}).get("evidence_alerts") or []:  # e.g. Tracekit capture gaps
+        out.append({"severity": "high", "title": e.get("title", "Evidence problem"), "detail": e.get("detail", ""),
+                    "node": None})
     for nid, n in sorted(g.nodes.items(), key=lambda kv: kv[1]["seq"]):
         if n["type"] != "action":
             continue
@@ -202,7 +235,9 @@ def alerts(run: Run, g: Graph) -> List[Dict[str, Any]]:
         bad = [p for p in prov if p["status"] == "untrusted-only"]
         base = {"node": nid, "tool": ev["tool"], "agent": ev["agent"], "seq": ev["seq"],
                 "target": suggest_target(run, ev, prov), "sensitive": sens}
-        if sens and bad:
+        if ev.get("status") == "blocked":
+            pass  # reported below, once
+        elif sens and bad:
             out.append({**base, "severity": "high",
                         "title": f"{ev['tool']} used a value that only untrusted content supplied",
                         "detail": f"'{bad[0]['value']}' appears only in " +
@@ -211,7 +246,11 @@ def alerts(run: Run, g: Graph) -> List[Dict[str, Any]]:
             out.append({**base, "severity": "review",
                         "title": f"Sensitive action {ev['tool']} is downstream of untrusted input",
                         "detail": "Reached from " + ", ".join(untrusted_up) + ". Reach is not cause; test it."})
-        if ev.get("status") == "error":
+        if ev.get("status") == "blocked":
+            by = "Tracekit policy" if (ev.get("policy") or {}).get("decision") in ("deny", "ask") else "the guard"
+            out.append({**base, "severity": "high", "title": f"{ev['tool']} was blocked by {by}",
+                        "detail": (ev.get("guard") or {}).get("reason", "")})
+        elif ev.get("status") == "error":
             out.append({**base, "severity": "review", "title": f"{ev['tool']} failed",
                         "detail": _txt(run.value(ev["result_ref"]))[:200]})
         if ev.get("mode") == "stub":
@@ -288,11 +327,14 @@ def run_summary(run: Run, g: Optional[Graph] = None, al: Optional[List[Dict[str,
         "model_ms": round(sum(d.get("duration_ms") or 0 for d in decs), 2),
         "tool_ms": round(sum(a.get("duration_ms") or 0 for a in acts), 2),
         "usage": usage, "tests": len(run.tests),
-        "confirmed_causes": len([t for t in run.tests if t["verdict"] == "causal"]),
+        "confirmed_causes": len([t for t in run.tests if t["verdict"] == "causal" and not t.get("group")]),
         "alerts": {s: len([a for a in al if a["severity"] == s]) for s in ("high", "review", "info")},
         "integrity": "ok" if not verify(run) else "failed",
         "tools_run": [a["tool"] for a in acts],
         "replayable": bool(run.start.get("program")),
+        "finished": bool(run.events) and run.events[-1]["type"] == "run.end",
+        "blocked": len([a for a in acts if a.get("status") == "blocked"]),
+        "guard": (run.start.get("guard") or {}).get("mode"),
     }
 
 
@@ -356,9 +398,9 @@ def influence_graph(paths: List[str]) -> Dict[str, Any]:
     for p in paths:
         try:
             run = load_run(p)
-        except (OSError, ValueError):
+            g = build_graph(run, infer=False)
+        except Exception:  # unreadable or malformed run: leave it out rather than fail the whole view
             continue
-        g = build_graph(run, infer=False)
         for nid, n in g.nodes.items():
             if n["type"] != "input" or n.get("kind") == "task":
                 continue
@@ -391,7 +433,8 @@ def influence_graph(paths: List[str]) -> Dict[str, Any]:
         eff = [t["effect"] for t in e["tests"]]
         e["max_effect"] = max(eff) if eff else None
         e["confirmed"] = any(t["verdict"] == "causal" for t in e["tests"])
-        e["ruled_out"] = bool(e["tests"]) and not e["confirmed"]
+        e["ruled_out"] = bool(e["tests"]) and not e["confirmed"] and all(
+            t["verdict"] != "causal" and _settled(t) == "ruled-out" for t in e["tests"])
     for s in sources.values():
         es = [e for e in edges.values() if e["source"] == s["id"]]
         s["max_effect"] = max([e["max_effect"] for e in es if e["max_effect"] is not None], default=None)
@@ -405,9 +448,8 @@ def workspace(paths: List[str]) -> Dict[str, Any]:
     runs = []
     for p in paths:
         try:
-            r = load_run(p)
-        except (OSError, ValueError):
-            continue
-        runs.append(run_summary(r))
+            runs.append(run_summary(load_run(p)))
+        except Exception as e:  # unreadable or malformed run: leave it out rather than fail the whole view
+            print(f"causeway: skipping {p}: {e}", file=sys.stderr)
     runs.sort(key=lambda r: r["started"], reverse=True)
     return {"runs": runs, "influence": influence_graph(paths)}

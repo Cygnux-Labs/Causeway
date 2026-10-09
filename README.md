@@ -29,6 +29,8 @@
 - [How causality is tested](#how-causality-is-tested)
 - [Evidence grades](#evidence-grades)
 - [Alerts](#alerts)
+- [Live mode and the guard](#live-mode-and-the-guard)
+- [Use with Tracekit](#use-with-tracekit)
 - [Server, API and remote agents](#server-api-and-remote-agents)
 - [Command reference](#command-reference)
 - [How it fits together](#how-it-fits-together)
@@ -92,8 +94,8 @@ $ pip install . && causeway demo --out runs
 
 == counterfactual tests (n=40 paired replays each; tools served from tape)
   remove input:vendor:portal/notes.md  target tool=send_email,arg~vendor-compliance  P(with)=0.80 P(without)=0.00 effect=+0.80 [+0.63, +0.90]  CAUSAL
-  remove input:web:shipping_faq        target tool=send_email,arg~vendor-compliance  P(with)=0.80 P(without)=0.80 effect=+0.00 [-0.18, +0.18]  NO-DETECTABLE-EFFECT
-  remove input:inbox:ticket-881        target tool=send_email,arg~vendor-compliance  P(with)=0.80 P(without)=0.80 effect=+0.00 [-0.18, +0.18]  NO-DETECTABLE-EFFECT
+  remove input:web:shipping_faq        target tool=send_email,arg~vendor-compliance  P(with)=0.80 P(without)=0.80 effect=+0.00 [-0.18, +0.18]  RULED-OUT
+  remove input:inbox:ticket-881        target tool=send_email,arg~vendor-compliance  P(with)=0.80 P(without)=0.80 effect=+0.00 [-0.18, +0.18]  RULED-OUT
   remove msg:researcher->planner       target tool=send_email,arg~vendor-compliance  P(with)=0.80 P(without)=0.00 effect=+0.80 [+0.63, +0.90]  CAUSAL
   remove input:kb:refund_policy.md     target tool=issue_refund                      P(with)=0.93 P(without)=0.00 effect=+0.93 [+0.77, +0.97]  CAUSAL
 
@@ -153,7 +155,7 @@ The core screen. Pick a tool call and you get:
 - **Where each argument came from**: `customers.csv` came from a trusted tool result; the address came only from untrusted content.
 - **One sentence of verdict**: the confirmed cause and how much it moved the outcome.
 - **How it got here**: the recorded path through the agents, with every untrusted root.
-- **Candidate causes**: every upstream input and message channel, marked *confirmed cause*, *ruled out* or *not tested*, with effect size, CI, with → without rates, and how much of its wording the next model output reused. In live mode, **Run test** replays on the spot.
+- **Candidate causes**: every upstream input and message channel, marked *primary cause*, *contributing factor*, *confirmed cause* (share unclear), *inconclusive*, *ruled out* or *not tested*, with effect size, CI, with → without rates, and how much of its wording the next model output reused. In live mode, **Find the cause** runs the whole attribution (below) and **Run test** tests one input.
 
 See the screenshot at the top of this page. Dark theme:
 
@@ -245,6 +247,9 @@ rt.finish()
 
 Every system prompt, message block and tool result in each request becomes a context item, with no `decide([...])` lists to maintain. Results of tools in `untrusted_tools` are marked untrusted, so alerts and taint see injected content. See [`examples/anthropic_agent.py`](examples/anthropic_agent.py). This adapter is tested against a fake client that mimics the SDK's response objects; it has not yet been run against the live API.
 
+
+No API key? Ollama serves the same Messages API, so you can try the adapter against a local model: `ANTHROPIC_BASE_URL=http://localhost:11434 ANTHROPIC_API_KEY=ollama CAUSEWAY_MODEL=qwen2.5:7b python examples/anthropic_agent.py block`.
+
 ### 3. Ship events from another process
 
 ```python
@@ -267,8 +272,23 @@ See [Server, API and remote agents](#server-api-and-remote-agents) and [`example
 |---|---|
 | `causal` | the interval is above zero: removing it makes the target less likely |
 | `suppressive` | the interval is below zero: removing it makes the target more likely |
-| `no-detectable-effect` | the interval includes zero; its upper end bounds how large an effect could hide |
+| `ruled-out` | the interval shows any effect is smaller than 20 points (`min_effect`) |
+| `inconclusive` | the interval is too wide to say either way. The result gives how often the target reproduced and a suggested `n` |
 | `not-applied` | the spec matched nothing |
+
+A test never says "ruled out" just because its interval includes zero. With few trials, an interval like [−0.19, +0.40] includes zero and also a 40-point effect, so it's inconclusive.
+
+**Sequential testing** (`--n-max`). Real models repeat a harmful action in only some replays, and a fixed small `n` then can't decide. With `--n 10 --n-max 160`, the test runs 10 pairs, checks, and keeps doubling until the verdict is decisive or it reaches 160. The interval is widened for the number of checks (Bonferroni), so stopping early doesn't add false positives. On an agent that follows an injection in 25% of runs, 10 fixed trials find the cause 13% of the time. Sequential testing finds it every time, using 38 trials on average. Across 200 tests of an input with no effect, it called 5.5% causal, in line with the 5% target. The app's **Run test** button uses `--n 20 --n-max 160`.
+
+**Find the cause** (`causeway attribute RUN --target SPEC`, or the button in the app) runs the whole investigation for one action, like `git bisect` for agent incidents:
+
+1. Remove **every** untrusted input upstream of the action at once. If the action still happens about as often, none of them is the reason: the agent does this on its own, or for a reason that wasn't recorded. One test answers that.
+2. Otherwise narrow down: test the suspects one by one (with more than four, halve the group).
+3. Classify each cause from its interval. A **primary cause** confidently explains at least half of the occurrences. A **contributing factor** confidently explains less than half; the action mostly happens without it too. A **confirmed cause** is proven causal, but its share isn't clear yet. When the group matters but no single input does, each input is enough on its own; it reports them as **joint (redundant) causes** and checks which members really are.
+
+All tests share one "nothing removed" arm, and every interval is corrected for all the tests the attribution may run. On the simulated benchmark it needs 6–20% fewer model calls than testing each input separately, and when no input is the cause it needs one test instead of one per input. Sizing each cause's share costs extra replays; `--no-roles` skips it. `--workers N` runs replays in parallel, which helps with hosted APIs (or Ollama with `OLLAMA_NUM_PARALLEL`).
+
+Why it costs model calls at all: real models are random, so proving a cause means re-running the agents many times with and without each suspect. On the first real-model benchmark that was 180–540 calls per incident.
 
 **Decision replay** (`causeway test RUN --decision SEQ --remove SPEC [--contains TEXT]`) re-calls one recorded model call with and without one context item, using only the log. Use it when the whole system can't be re-run, or to find which model call an effect enters at.
 
@@ -299,6 +319,73 @@ Tracing ("blast radius") follows observed edges and answers *what could this hav
 
 Sensitive tools are the ones you declare. If a run declares none, tool names such as send, pay, delete or export are treated as sensitive and labelled "by name".
 
+Values are traced through the task, inputs and tool results. A tool result counts as untrusted when it was recorded as untrusted (`untrusted_tools=[...]`, `act(..., untrusted=True)`, or an adapter), or when the action itself is marked untrusted, such as a subagent's answer after it read untrusted content. A whole string argument of 6+ characters that appears verbatim in untrusted content counts as coming from it, so very short, generic argument strings can produce false positives.
+
+## Live mode and the guard
+
+Recording is always live: each event is appended as it happens. Three things make the analysis live too.
+
+**1. The guard checks sensitive tool calls before they run.** It applies the high-alert rule above at call time. Treat it as a **tripwire, not a defense**: it catches injected values that reach a tool verbatim, and it opens the investigation at the moment it matters. An attacker who gets the model to paraphrase or re-encode a value ("audit at vendor-compliance dot example") gets past it. For prevention, use an information-flow-control system such as [CaMeL](https://arxiv.org/abs/2503.18813) or [FIDES](https://devblogs.microsoft.com/agent-framework/fides/), and use Causeway to investigate what got through.
+
+```python
+from causeway import Guard, Runtime
+from causeway.guard import webhook
+
+guard = Guard("block", on_alert=webhook("https://hooks.slack.com/services/..."))   # or "alert"
+rt = Runtime(models, tools, sensitive_tools=["send_email"], untrusted_tools=["web_fetch"], guard=guard)
+```
+
+The default is `alert`. In `block` mode, a sensitive call that would use a value only untrusted content supplied does not execute. The agent gets `{"error": "blocked by causeway guard: ..."}` back, and the action is recorded with `status: "blocked"` and the verdict (hash-chained with it). In `alert` mode the call goes through and the verdict is recorded. `on_alert` receives high alerts by default (`notify=` to change). Add your own rules as functions of a `CheckContext`:
+
+```python
+def no_large_wires(ctx):
+    if ctx.tool == "wire" and ctx.args.get("amount", 0) > 1000:
+        return {"title": "wire over 1000"}
+Guard("block", rules=[no_large_wires])
+```
+
+With the Anthropic adapter, use `msgs.run_tool(block, fn)`: guard check, run, record, and the `tool_result` block to send back. `causeway record module:SYSTEM --guard block` runs a System under the guard. Replays never use the guard.
+
+**2. The app updates as runs are recorded.** `causeway serve` watches the runs folder (and anything ingested), recomputes alerts for each run that changes, and pushes them to the app over `/api/stream`. A run in progress shows as *running*, and a new high alert pops up. `--webhook URL` also POSTs each new high alert. `HttpSink` sends after every tool call, so a remote collector sees calls as they happen.
+
+**3. `causeway watch ROOT`** prints new alerts in the terminal as runs are recorded.
+
+Try it without an API key:
+
+```bash
+causeway serve runs-live                         # terminal 1, open http://127.0.0.1:7788
+python examples/live_demo.py runs-live block     # terminal 2
+```
+
+The guard sees exactly what the log has recorded so far. Content an agent read without `observe()`, `untrusted_tools` or an adapter is invisible to it.
+
+## Use with Tracekit
+
+[Tracekit](https://github.com/Cygnux-Labs/Tracekit) records what an agent did as signed, witnessed evidence. Causeway explains why. Import a Tracekit run and the whole investigation app works on it, with every event citing the signed Tracekit records behind it:
+
+```bash
+causeway import tracekit ~/.tracekit --list                         # runs in the ledger
+causeway import tracekit ~/.tracekit --run <session> --out runs --sensitive send_email
+causeway serve runs
+```
+
+| Tracekit | Causeway |
+|---|---|
+| `user.prompt` | task input (trusted) |
+| `model.exchange` request + response | model call; context rebuilt block by block from the recorded request (`exact`), or from what the agent had seen so far when the request was hashed (`reconstructed`) |
+| `tool.call` + `tool.result` | tool call, linked to the model call that asked for it |
+| results of untrusted tools (default: all but subagents; `--untrusted-tool` / `--trusted-tool`) | untrusted input `tool:<name>` |
+| subagent spawn and answer | messages parent → child and child → parent, so lineage and candidate causes cross agents |
+| policy deny, or ask not approved | tool call with status *blocked* and Tracekit's rule ids |
+| policy flag / ask | sensitive tool call |
+| `capture.gap`, `trace.tamper`, failed signatures | high alerts: the evidence is incomplete |
+
+`tracekit-map.json` maps each Causeway event to the Tracekit records (seq, hash) it came from. The app shows them in each event's drawer. With the `tracekit` package installed, the import also verifies the ledger's chain and signatures.
+
+The two tools catch different things. On a two-agent prompt-injection run, Tracekit's policy denied a `sudo` command but allowed the email that exfiltrated data, because a regex on arguments can't see where a value came from. Imported into Causeway, that email is the one high alert. Its lineage reads `tool:fetch_page > researcher call > researcher → main > coordinator call > send_email`, and a decision-level test confirms the cause.
+
+What Causeway needs from Tracekit: `content_capture: full` (at least for untrusted tools), so values can be traced, and model calls recorded (autotrace, the SDK or the model proxy), so there are decisions. With hashed content the run still imports, but provenance says "content hashed: can't trace" instead of guessing.
+
 ## Server, API and remote agents
 
 ```bash
@@ -310,12 +397,13 @@ causeway serve runs --token "$CAUSEWAY_TOKEN" --allow-program myapp.agents:SYSTE
 | GET | `/` | the app |
 | GET | `/api/workspace` | run summaries and the influence graph |
 | GET | `/api/runs/<id>` | one run's investigation data |
+| GET | `/api/stream` | server-sent events: a run changed (with its new alerts), a test finished |
 | POST | `/api/runs/<id>/tests` | run a replay test (allow-listed programs only) |
 | POST | `/v1/ingest` | receive events (`Authorization: Bearer <token>`) |
 
 Before writing anything, ingestion checks the token, every blob's hash, that each event's `seq` and `prev_hash` continue the stored chain, each event's hash, and that every referenced blob exists. Edits, gaps, forks, forged blobs and replayed batches are rejected (401 / 409 / 422).
 
-Security posture: the app and read API have **no authentication** yet. The server binds to 127.0.0.1 by default and warns on any other host. Replay imports the Python program a run names, so it is allowed only for programs you list with `--allow-program`.
+Security posture: the app and read API have **no authentication** yet. The server binds to 127.0.0.1 by default and warns on any other host. On a loopback bind it refuses requests whose `Host` header isn't a loopback name, which blocks DNS-rebinding pages. Ingested events are also checked for the fields each type needs, and a malformed run is skipped rather than breaking the workspace. Replay imports the Python program a run names, so it is allowed only for programs you list with `--allow-program`.
 
 ## Command reference
 
@@ -324,11 +412,15 @@ Security posture: the app and read API have **no authentication** yet. The serve
 | `causeway demo [--out DIR] [--n N]` | Record the demo, run tests, write `report.html` |
 | `causeway record module:SYSTEM --out DIR [--seed S]` | Record one run of a System |
 | `causeway report ROOT [-o FILE]` | Static app for every run under ROOT |
-| `causeway serve ROOT [--host] [--port] [--token] [--allow-program SPEC]` | App, API and ingestion |
+| `causeway record module:SYSTEM [--guard alert\|block] [--webhook URL]` | Record one run under the live guard |
+| `causeway serve ROOT [--host] [--port] [--token] [--allow-program SPEC] [--webhook URL]` | App, API, ingestion and live updates |
+| `causeway watch ROOT [--webhook URL]` | Print new alerts as runs are recorded |
+| `causeway import tracekit SRC [--run R] [--out DIR] [--sensitive TOOL] [--list]` | Import Tracekit runs |
 | `causeway verify RUN` | Check chain, seq, event hashes, blob hashes |
 | `causeway taint RUN [--source SPEC] [--inferred] [--json]` | Blast radius with paths |
 | `causeway test RUN --remove SPEC --target SPEC [--n N] [--live-tools]` | Run replay test |
-| `causeway test RUN --decision SEQ --remove SPEC [--contains TEXT]` | Decision replay test |
+| `causeway attribute RUN --target SPEC [--suspect SPEC] [--n N] [--n-max N] [--workers N] [--no-roles]` | Find the cause: group test, then narrow down; primary, contributing and joint causes |
+| `causeway test RUN --decision SEQ --remove SPEC [--contains TEXT] [--anthropic]` | Decision replay test; `--anthropic` re-sends a call recorded by the adapter |
 | `causeway matrix RUN --target SPEC [--n N]` | Test every channel and input against targets |
 | `causeway replay RUN [--remove SPEC]` | Re-run from tape and diff against the original |
 | `causeway graph RUN [--json] [--no-infer]` | Edges with evidence grades |
@@ -380,11 +472,22 @@ Formats and algorithms in detail: [docs/architecture.md](docs/architecture.md).
 | reach | blame every untrusted input upstream of the action (what tracing alone gives you) |
 | provenance | blame inputs that are the only untrusted source of an argument value (string matching) |
 | reuse | blame the untrusted input whose wording was reused most |
-| **causeway** | replay without each untrusted input, exact paired test per input, false-discovery-rate control across them |
+| **causeway** | replay without each untrusted input; blame the ones whose verdict is `causal` (sequential, corrected for the number of inputs and looks) |
 
 There are five scenarios with one planted cause each (exfiltration, a refund over the limit, a destructive ops command, an injection two agents away, and a working injection next to an ignored one) plus a clean control. Run it with `python -m bench`.
 
-**Current results use a simulated model and only show that the pipeline and scoring work.** On it, replay names exactly the true cause in all 61 harmful runs with no false blames. Tracing alone never isolates it, and string matching is right when the injection plants a unique value but abstains on 39% of runs, where it doesn't. The simulation also shows a hard floor on replay budget: with fewer than 6 replays per input the exact test can never reach significance, and at 10 replays it finds the cause in 69% of runs. **Real-model results are not in yet.** Running the benchmark against real models is an [open issue](https://github.com/Cygnux-Labs/Causeway/issues) and a good way to contribute: `python -m bench --model claude --claude-model <id>` locally, or the Benchmark workflow in Actions with an API key secret. Details and limitations: [bench/README.md](bench/README.md).
+**First real-model results** (Qwen 2.5 7B on a laptop through Ollama, no API key; [details](bench/README.md#results-a-real-model-qwen-25-7b-local)):
+
+| | Harmful runs attributed | Causeway named exactly the true cause | False blames |
+|---|---|---|---|
+| Where a ground-truth check confirms the planted document drives the harm (exfiltration, two-hop bcc, admin escalation) | 6 | **6 of 6** | 0 |
+| Where it barely does (`refund-override`: the model refunds 92% of the time with or without it) | 3 | 1, plus 2 inconclusive | 0 |
+| Tracing alone (reach) | 9 | 0 (always blames every untrusted input) | – |
+| String matching (provenance) | 9 | 6, abstains on the other 3 | 0 |
+
+The first real-model run used 10 fixed replays per input and named the cause in only 1 of 10. A real model repeats a harmful action in only some replays, so a fixed small sample rarely decides. That run is why Causeway now has sequential tests and an `inconclusive` verdict, and why the benchmark checks its own ground truth. Each attribution costs 320–540 model calls. One 7B model and nine harmful runs are first evidence, not a leaderboard: hosted models and larger samples are next. `python -m bench --model openai --openai-model qwen2.5:7b` reproduces it locally; `--model claude` and the Benchmark workflow run it on Claude with an API key.
+
+On a simulated model the pipeline names the true cause in all 61 harmful runs with no false blames ([results](bench/results/sim-2026-10-05.md)). That checks the machinery, not a real model.
 
 ## Related work
 
@@ -396,13 +499,18 @@ Counterfactual replay for agents is an active research area. Judging from their 
 - [BranchPoint-Latent](https://arxiv.org/html/2606.14805) predicts which events in multi-agent traces replay would mark as high-effect, without running replays.
 - [From Agent Traces to Trust](https://arxiv.org/html/2606.04990v5) surveys evidence tracing and execution provenance for LLM agents.
 
+Two other lines of work are close to parts of Causeway:
+
+- **Context attribution for one model call.** [ContextCite](https://arxiv.org/abs/2409.00729) and [TracLLM](https://www.usenix.org/conference/usenixsecurity25/presentation/wang-yanting) find which parts of a prompt an output depends on, by ablation with a learned surrogate or an informed search. That is the question Causeway's decision-level test asks, and their search methods could make it cheaper.
+- **Information-flow control for agents.** [CaMeL](https://arxiv.org/abs/2503.18813) and [FIDES](https://devblogs.microsoft.com/agent-framework/fides/) label data as trusted or untrusted, propagate the labels deterministically, and enforce policies before tools run. They prevent; Causeway investigates. The guard here is a much weaker, string-matching tripwire and is not a substitute.
+
 Causeway's emphasis is different: it attributes a *specific harmful action* to the *content and message channels* that caused it, across agents, with a recorded data-flow graph. Its replay serves recorded tool results so it can't repeat real side effects. It pairs that with integrity checks, alerts for injection-shaped flows, and a cross-run influence view. Step-level attribution and replay-free prediction are complementary, and both would be useful additions here.
 
 ## Relation to Tracekit
 
 [Tracekit](https://github.com/Cygnux-Labs/Tracekit) is the evidence layer: tool calls signed by a separate OS user, hash-chained, checkpointed to an external witness, and verifiable offline. It proves *what* was recorded and that the record wasn't changed.
 
-Causeway is the analysis layer: *why* things happened, and whether that holds up under intervention. Causeway's own chain detects edits but is unsigned, so anyone who can rewrite the whole log can rebuild it. The plan is to write Causeway events through Tracekit's signer, so a causal claim points at a record nobody could quietly alter.
+Causeway is the analysis layer: *why* things happened, and whether that holds up under intervention. Causeway's own chain detects edits but is unsigned, so anyone who can rewrite the whole log can rebuild it. Today, `causeway import tracekit` turns a Tracekit run into a Causeway run whose events cite the signed records (see [Use with Tracekit](#use-with-tracekit)). The next step is writing Causeway events through Tracekit's signer as agents run.
 
 | | Tracekit | Causeway |
 |---|---|---|
@@ -414,11 +522,11 @@ Causeway is the analysis layer: *why* things happened, and whether that holds up
 ## Limits
 
 - **An effect is a total effect for this program on this task.** It doesn't explain the model's internal reasons, and it may not transfer to other tasks.
-- **"Ruled out" is bounded, not zero.** At n = 40 the demo's intervals are about ±18 points. Raise n for tighter bounds.
-- **Multiple comparisons.** Each test reports an exact paired p-value, and the benchmark applies false-discovery-rate control across an action's inputs. The app's verdicts still use each test's own 95% interval, so testing many inputs there can produce chance "causal" results.
+- **"Ruled out" means "smaller than 20 points", not zero.** At n = 40 the demo's intervals are about ±18 points. Below that precision a test says *inconclusive*. Use `--n-max` to let it run until it can decide.
+- **Multiple comparisons.** Each test reports an exact paired p-value. `family=k` corrects the interval when k inputs of one action are tested together; the benchmark does this. The app's **Run test** button tests one input at a time without that correction, so testing many inputs there one by one can produce a chance "causal" (about 1 in 20 per input with no effect).
 - **The graph is only as complete as the recorded context.** If your code sends a model something it doesn't record, the graph misses it. The Anthropic adapter closes that gap for that SDK; a model-proxy cross-check like Tracekit's would close it in general.
 - **Replay costs model calls**: about 2·n per test per downstream model call. There are no budgets or caching yet.
-- **Run replay needs a re-executable program.** Decision replay doesn't, but decisions recorded through the adapter can't be decision-replayed yet.
+- **Run replay needs a re-executable program.** Decision replay doesn't. Calls recorded through the Anthropic adapter (or imported from Tracekit with the request in clear) can be re-sent without an input. Real models ignore seeds, so decision tests compare against a no-removal control call.
 - **Tape matching is exact on tool arguments.** New calls are stubbed, which can change behaviour after the stub; results report `off_tape_actions`.
 - **Inferred edges are heuristic** and miss paraphrase.
 - **The demo models are seeded mock policies.** The demo numbers show the method works, not how any real model behaves.
@@ -431,28 +539,30 @@ v0.3 is an alpha: it works and is tested, but it is not a production service.
 |---|---|
 | SDK, event schema, hash chain | Working, tested |
 | Investigation app (static and live) | Working; checked in a browser in light, dark and phone layouts |
-| Run and decision replay with intervals and exact paired tests | Working on the demo and the simulated benchmark; not yet run against a real model |
+| Run and decision replay with intervals, sequential tests and exact paired tests | Working; on a real 7B model, 6 of 6 correct where the planted cause is confirmed, 0 false blames (small sample) |
 | Ingestion with integrity checks | Working, single shared token |
-| Anthropic adapter | Working against a fake client |
+| Anthropic adapter | Working, including guarded `run_tool` and decision replay; checked end to end against a real model (Qwen 2.5 7B through Ollama's Anthropic-compatible API): the guard blocked a real exfiltration attempt, and re-sending the call without the fetched page confirmed it as the cause (60% → 0%) |
+| Live guard, live app updates, webhooks, `watch` | Working, tested; the guard's rule is the provenance alert, so it inherits its false-positive profile |
+| Tracekit import | Working on synthetic and real Tracekit ledgers (signatures verified when `tracekit` is installed) |
 | App and API authentication, users, roles, SSO | Not built; localhost only |
 | Multi-tenancy, retention, PII redaction | Not built (Tracekit's redaction can be reused) |
 | Storage at scale | Plain files; needs Postgres or ClickHouse plus an object store |
 | OpenTelemetry GenAI import; OpenAI, LangGraph adapters; streaming | Not built |
-| Signing and external witness via Tracekit | Not built |
+| Writing Causeway's own events through Tracekit's signer; one shared pre-execution gate | Not built (import works today) |
 | Replay budgets, caching, choosing which edges to test | Not built |
 
-Next steps, roughly in order. Each one is tracked as a [GitHub issue](https://github.com/Cygnux-Labs/Causeway/issues).
+Next steps, roughly in order. Discussion happens in [GitHub issues](https://github.com/Cygnux-Labs/Causeway/issues).
 
-1. Run the benchmark against real models and publish the numbers.
-2. An LLM gateway (OpenAI-compatible and Anthropic endpoints), so any agent can be recorded by changing one base URL.
-3. Adapters for the OpenAI SDK, LangGraph and the OpenAI Agents SDK.
-4. OpenTelemetry GenAI import, so teams can bring traces they already have.
-5. An MCP proxy that records tool calls and serves the replay tape without code changes.
-6. Decision replay for adapter-recorded calls.
-7. Write events through Tracekit's signer.
+1. Cases and investigation reports: probable cause, contributing factors (the refund scenario needs them), ruled-out and inconclusive inputs, each claim linked to evidence; causal chains proven hop by hop from logs alone.
+2. Run the benchmark on hosted frontier models and larger samples.
+3. An LLM gateway (OpenAI-compatible and Anthropic endpoints), so any agent can be recorded by changing one base URL.
+4. Adapters for the OpenAI SDK, LangGraph and the OpenAI Agents SDK.
+5. OpenTelemetry GenAI import, so teams can bring traces they already have.
+6. An MCP proxy that records tool calls and serves the replay tape without code changes.
+7. Tracekit: case reports that link to the signed records behind each claim, and Tracekit flags that open a Causeway case. Causeway stays usable without Tracekit.
 8. Authentication for `causeway serve`, then tenants and a database backend.
 9. PII redaction in the SDK.
-10. Replay cost controls: adaptive stopping and ranking which inputs to test first.
+10. Replay cost: rank which inputs to test first, cheaper ContextCite- or TracLLM-style search, caching and per-investigation budgets (sequential stopping is done).
 
 ## Repository layout
 
@@ -460,10 +570,13 @@ Next steps, roughly in order. Each one is tracked as a [GitHub issue](https://gi
 causeway/
   core.py  graph.py  replay.py  analysis.py  evals.py  view.py  server.py  cli.py  demo.py
   app.html                 the investigation app
+  guard.py                 the live guard: check sensitive tool calls before they run
   adapters/anthropic.py
+  importers/tracekit.py    Tracekit ledger -> Causeway run
 examples/
   quickstart.py            two agents, one injected page, one test
-  anthropic_agent.py       a real Claude tool-use loop, recorded
+  anthropic_agent.py       a real Claude tool-use loop, recorded and guarded
+  live_demo.py             watch agents live in the app while the guard blocks the injection
   remote_agent.py          ship events to a collector
   demo/report.html         the app with the 8 recorded demo runs embedded
   demo/runs.tar.gz         the raw logs of those runs and their tests
