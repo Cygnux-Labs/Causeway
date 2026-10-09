@@ -109,6 +109,8 @@ def influence_index(paths: Iterable[str], targets: Iterable[str] = ()) -> List[D
             for t in targets:
                 row["target_runs"][t] += fired[t]
         for test in run.tests:
+            if test.get("group"):
+                continue  # a group test is not evidence about any single member
             for nid in _nodes_for(g, test["intervention"]):
                 ev = g.nodes[nid]["event"]
                 if ev["ref"] in idx:

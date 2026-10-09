@@ -12,7 +12,8 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square)](LICENSE)
 [![CI](https://img.shields.io/badge/CI-pytest%203.9%E2%80%933.13-blue?style=flat-square)](.github/workflows/ci.yml)
 
-<img src="docs/images/why.png" alt="The 'Why did it happen?' screen: a flagged send_email to an outside address, where each argument came from, the path through three agents, and candidate causes marked confirmed, ruled out or not tested." width="100%">
+<a href="docs/media/causeway-demo.mp4"><img src="docs/media/causeway-demo.gif" alt="70-second walkthrough of the live app: eight recorded runs of a three-agent support system; a run where the customer list was emailed to an outside address; the timeline; where each argument came from; Find the cause proving the vendor note is the primary cause (85% to 0%); the data-flow graph with the proven cause in red; and a new run appearing live while the guard blocks the exfiltration email." width="100%"></a>
+
 
 </div>
 
@@ -157,7 +158,9 @@ The core screen. Pick a tool call and you get:
 - **How it got here**: the recorded path through the agents, with every untrusted root.
 - **Candidate causes**: every upstream input and message channel, marked *primary cause*, *contributing factor*, *confirmed cause* (share unclear), *inconclusive*, *ruled out* or *not tested*, with effect size, CI, with → without rates, and how much of its wording the next model output reused. In live mode, **Find the cause** runs the whole attribution (below) and **Run test** tests one input.
 
-See the screenshot at the top of this page. Dark theme:
+<img src="docs/images/why.png" alt="The 'Why did it happen?' screen: a flagged send_email to an outside address, where each argument came from, the path through three agents, and candidate causes with their status." width="100%">
+
+Dark theme:
 
 <img src="docs/images/why-dark.png" alt="The same screen in dark theme" width="100%">
 
@@ -585,6 +588,7 @@ docs/
   architecture.md          formats, algorithms, statistics, API
   releasing.md             PyPI release steps
   images/                  screenshots used here
+  media/                   the demo walkthrough (MP4 and the GIF at the top of this page)
 tests/                     pytest suite
 ```
 

@@ -228,6 +228,7 @@ def counterfactual(run: Run, intervention: Union[str, Sequence[str]], target: st
     plan = looks(n, n_max)
     z = z_for(len(plan) * family)
     i = 0
+    stopped = "n_max"
     pool = ThreadPoolExecutor(workers) if workers > 1 else None
     try:
         for size in plan:
@@ -247,7 +248,11 @@ def counterfactual(run: Run, intervention: Union[str, Sequence[str]], target: st
             verdict = verdict_for(lo, hi, matched > 0, min_effect)
             if verdict == "causal" and size_role and role_for(k0 / i, [lo, hi]) == "cause":
                 continue  # proven; keep going until its share is clear too
-            if verdict in DECISIVE or verdict == "not-applied" or (len(plan) > 1 and _futile(i, n, (k0 - k1) / i)):
+            if verdict in DECISIVE or verdict == "not-applied":
+                stopped = "decisive"
+                break
+            if len(plan) > 1 and _futile(i, n, (k0 - k1) / i):
+                stopped = "futility"  # no effect seen; stopped to save replays, not proof of none
                 break
     finally:
         if pool:
@@ -256,7 +261,7 @@ def counterfactual(run: Run, intervention: Union[str, Sequence[str]], target: st
     p0, p1 = k0 / n, k1 / n
     result = {
         "intervention": label, "target": target, "n": n, "looks": len(plan), "n_max": plan[-1],
-        "family": family,
+        "family": family, "stopped": stopped,
         "p_with": round(p0, 4), "p_without": round(p1, 4),
         "effect": round(p0 - p1, 4), "ci": [round(lo, 4), round(hi, 4)],
         "verdict": verdict, "pair_flips": flips,

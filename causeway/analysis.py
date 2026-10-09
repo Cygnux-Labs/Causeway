@@ -181,7 +181,8 @@ def candidates(run: Run, g: Graph, action_node: str) -> List[Dict[str, Any]]:
                      "role": _role(best) if status in ("confirmed", "contributing") and best.get("p_with") is not None
                      else None,
                      "test": best, "reuse": reuse})
-    order = {"confirmed": 0, "contributing": 1, "suppressive": 2, "inconclusive": 3, "untested": 4, "ruled-out": 5}
+    order = {"confirmed": 0, "contributing": 1, "suppressive": 2, "inconclusive": 3, "untested": 4,
+             "no-effect-seen": 5, "ruled-out": 6}
     rows.sort(key=lambda r: (order[r["status"]], -(r["test"]["effect"] if r["test"] else 0),
                              r["trust"] != "untrusted", -r["reuse"]))
     return rows
@@ -194,6 +195,8 @@ def _role(t: Dict[str, Any]) -> str:
 
 def _settled(t: Dict[str, Any]) -> str:
     """ruled-out or inconclusive, also for tests saved before the two were told apart."""
+    if t["verdict"] == "inconclusive" and t.get("stopped") == "futility":
+        return "no-effect-seen"
     if t["verdict"] in ("ruled-out", "inconclusive"):
         return t["verdict"]
     lo, hi = t["ci"]
@@ -366,7 +369,7 @@ def channel_report(run: Run, g: Graph) -> List[Dict[str, Any]]:
         if g.out_edges(n["id"], ("observed",)):
             c["used"] += 1
     for t in run.tests:
-        if t["intervention"].startswith("msg:") and t["intervention"][4:] in chans:
+        if not t.get("group") and t["intervention"].startswith("msg:") and t["intervention"][4:] in chans:
             chans[t["intervention"][4:]]["tests"].append(t)
     return list(chans.values())
 

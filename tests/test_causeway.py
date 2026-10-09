@@ -343,3 +343,19 @@ def test_attribute_cli_on_the_demo(tmp_path, capsys):
     assert cli(["attribute", run.path, "--target", EXFIL_TARGET, "--n", "10", "--n-max", "40"]) == 0
     out = capsys.readouterr().out
     assert "primary cause input:vendor:portal/notes.md" in out
+
+
+def test_group_tests_never_draw_member_edges(tmp_path):
+    from causeway.analysis import investigation
+    from causeway.replay import attribute
+    run = exfil_run(tmp_path)
+    attribute(run, EXFIL_TARGET, n=10, n_max=40)          # saves the group test and the single tests
+    run = load_run(run.path)
+    assert any(t.get("group") for t in run.tests)
+    g = build_graph(run)
+    causal_src = {g.nodes[e["src"]]["label"] for e in g.edges if e["evidence"] == "tested" and e["verdict"] == "causal"}
+    assert causal_src == {"vendor:portal/notes.md"}       # not every member of the group
+    idx = influence_index([run.path], [EXFIL_TARGET])
+    tested = {s for r in idx for s in r["sources"] if any(t["verdict"] == "causal" for t in r["tested"])}
+    assert tested == {"vendor:portal/notes.md"}
+    assert investigation(run)["summary"]["confirmed_causes"] == 1
