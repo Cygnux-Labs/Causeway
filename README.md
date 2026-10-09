@@ -14,7 +14,6 @@
 
 <a href="docs/media/causeway-demo.mp4"><img src="docs/media/causeway-demo.gif" alt="70-second walkthrough of the live app: eight recorded runs of a three-agent support system; a run where the customer list was emailed to an outside address; the timeline; where each argument came from; Find the cause proving the vendor note is the primary cause (85% to 0%); the data-flow graph with the proven cause in red; and a new run appearing live while the guard blocks the exfiltration email." width="100%"></a>
 
-**[▶ Watch the demo in full quality (MP4, 70 s)](docs/media/causeway-demo.mp4)**: recorded from the live app with `causeway demo` data. No API key needed to reproduce it.
 
 </div>
 
