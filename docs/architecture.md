@@ -57,11 +57,11 @@ Type-specific fields:
 
 | Type | Fields |
 |---|---|
-| `run.start` | `program` (`module:ATTR` used for replay), `seed`, `interventions` (non-empty only in replays), `models`, `tools`, `sensitive_tools`, `meta` |
+| `run.start` | `program` (`module:ATTR` used for replay), `seed`, `interventions` (non-empty only in replays), `models`, `tools`, `sensitive_tools`, `untrusted_tools`, `guard` (mode, or null), `meta` (for imports: `source`, `content_capture`, `signatures`, `evidence_alerts`) |
 | `agent.start` | `parent`, `role` |
 | `input` | `ref`, `source` (free label such as `web:vendor-notes`), `trust` (`trusted` / `untrusted`), `kind` (`task` or `input`) |
-| `decision` | `model`, `purpose`, `params`, `seed`, `context` (list of `{ref, kind, source, trust, from_event}`), `ablated` (refs removed by an intervention), `output` (ref), `usage`, `status`, `duration_ms` |
-| `action` | `tool`, `args_ref`, `result_ref`, `decision` (event id that asked for it, or null), `status` (`ok` / `error`), `mode` (`live` / `tape` / `stub`), `sensitive`, `duration_ms` |
+| `decision` | `model`, `purpose`, `params` (adapter calls add `request`: the request layout by content hash), `seed`, `context` (list of `{ref, kind, source, trust, from_event}`), `ablated` (refs removed by an intervention), `output` (ref), `usage`, `status`, `duration_ms`; imports add `context_mode` (`exact` / `reconstructed`) |
+| `action` | `tool`, `args_ref`, `result_ref`, `decision` (event id that asked for it, or null), `status` (`ok` / `error` / `blocked`), `mode` (`live` / `tape` / `stub` / `blocked`), `sensitive`, `duration_ms`; optional `guard` (`{verdict, reason, alerts}`), `policy` (Tracekit's `{decision, rule_ids, policy_hash}`), `trust` (`untrusted` when the result carries untrusted content, e.g. a subagent's answer) |
 | `message` | `to`, `ref`, `decision`, `trust` |
 | `run.end` | `outcome` |
 
@@ -135,7 +135,7 @@ A tool is sensitive when the run declared it (`sensitive_tools`, or `act(..., se
 
 **Paired seeds** (common random numbers) mean the only difference within a pair is the intervention, which cuts the variance of the estimated difference considerably.
 
-**Verdicts:** `causal` if the CI lower bound > 0; `suppressive` if the upper bound < 0; `no-detectable-effect` otherwise; `not-applied` if the spec matched nothing in any trial.
+**Verdicts:** `causal` if the CI lower bound > 0; `suppressive` if the upper bound < 0; `ruled-out` if the whole interval lies within ±`min_effect` (default 0.2); `inconclusive` otherwise, with `n_needed` (the n at which the interval's half-width would reach `min_effect`); `not-applied` if the spec matched nothing in any trial.
 
 What a `causal` verdict means: in this program, on this task, removing X changes how often the target happens. It is a total effect through every path. It says nothing about the model's internal reasons.
 
@@ -146,17 +146,30 @@ What a `causal` verdict means: in this program, on this task, removing X changes
 - rebuild the decision's context from blobs;
 - call the model n times with the full context and n times without the matching items, paired seeds;
 - with `contains`, measure P(output contains the text) in each arm and report the difference with a Newcombe CI;
-- without it, measure how often the output differs from the paired full-context output, with a Wilson CI.
+- without it, measure how often the output differs from the paired full-context output, minus how often a second full-context call differs (`noise`), with a Newcombe CI on the difference. Real model APIs ignore seeds, so without the control any sampling noise would read as an effect.
 
-This measures the direct effect on one model call. It does not need the program to be re-runnable, which matters for production systems that can't be re-executed end to end. Decisions recorded through the Anthropic adapter can't be decision-replayed yet, because that needs a model function able to rebuild the original request.
+This measures the direct effect on one model call. It does not need the program to be re-runnable, which matters for production systems that can't be re-executed end to end. Decisions recorded through the Anthropic adapter store the request layout (which context item sat in which message block), and `adapters.anthropic.replay_model(client.messages)` rebuilds the request without the removed items. A removed tool result becomes `"[removed]"` so tool_use / tool_result pairing still holds.
+
+## Attribution (Find the cause)
+
+`replay.attribute(run, target, suspects=None, n=10, n_max=40)`:
+
+1. Group test: one counterfactual removing every suspect (default: untrusted inputs upstream of the target). Not causal: stop, and report the rate with all suspects removed (`unprompted_rate`).
+2. Causal: with 4 or fewer suspects, test each alone; with more, test halves and recurse into causal halves.
+3. A causal group with no causal member is a joint cause. For groups of 4 or fewer, a leave-one-in test per member (remove all the others) keeps the members that are enough on their own.
+
+All tests share `base_cache`, the "nothing removed" arm keyed by trial index; with paired seeds, trial i of that arm is the same computation for every intervention. The family for the Bonferroni correction is 1 + (m if m ≤ 4 else 2m − 2) + m, an upper bound on the number of tests. Roles use the interval of the effect divided by `p_with`: lower bound ≥ 0.5 is primary, upper bound < 0.5 is contributing, otherwise unclear. With `size_roles`, a test that has proven causality keeps sampling (up to `n_max`) until its role is clear.
 
 ## Statistics
+
+**Sequential tests.** With `n_max > n`, a test checks its interval at n, 2n, 4n, … and n_max (k looks), and stops at the first decisive verdict (causal, suppressive, ruled-out). Each look uses z for α = 0.05 / k (Bonferroni), and the reported McNemar p-value is multiplied by k. The union bound keeps the overall false-positive rate at or below 5% however early the test stops. It is conservative, and simpler than group-sequential boundaries (O'Brien-Fleming) that would spend α more efficiently.
 
 - **Wilson score interval** for a single proportion.
 - **Newcombe hybrid score interval** (method 10) for a difference of two proportions, built from the two Wilson intervals. It behaves well at 0% and 100%, which plain Wald intervals do not.
 
 - **Exact McNemar test** on the discordant pairs (target happened only with the item, or only without it). Its p-value is reported as `p_value`. With b discordant pairs all in one direction the smallest possible p is 2 × 0.5^b, so fewer than 6 discordant pairs can never reach p < 0.05.
-- **Benjamini–Hochberg** (`replay.benjamini_hochberg`) controls the false discovery rate when several inputs of one action are tested. The benchmark uses it at q = 0.05.
+- **Testing several inputs of one action** (`family=k`): the interval is corrected by Bonferroni across the k inputs (and the looks of a sequential test), so the verdicts for all of an action's suspects together keep a 5% false-positive rate. The benchmark scores this verdict. `replay.benjamini_hochberg` is still available for false-discovery-rate control over p-values.
+- **Futility stopping** (sequential tests): after at least 2n pairs, a test whose estimated effect is within 5 points of zero stops. It can only lose power, never add false positives.
 
 Intervals are computed at 95% (z = 1.96). The app's verdicts use each test's own interval and are not corrected across tests.
 
@@ -171,6 +184,7 @@ Intervals are computed at 95% (z = 1.96). The app's verdicts use each test's own
 | GET | `/api/runs/<id>` | everything the app shows for one run |
 | POST | `/api/runs/<id>/tests` | `{"intervention", "target", "n"}` → run replay; only for programs passed with `--allow-program`; cross-origin requests refused |
 | POST | `/v1/ingest` | `Authorization: Bearer <token>`; body `{"events": [...], "blobs": {ref: value}}` |
+| GET | `/api/stream` | server-sent events: `{"type": "run", run_id, events, finished, alerts: [new ones]}` and `{"type": "test", ...}` |
 | GET | `/healthz` | liveness |
 
 Ingest validation, all before anything is written:
@@ -197,3 +211,15 @@ Rejections: 401 bad token, 409 gap / fork / replayed batch, 422 bad hash or miss
 - `cited_by` counts observed context edges from the source, meaning how many decisions used it.
 
 A citation index counts who cited whom. This one also records which citations were shown to matter. Tests are attached to outcomes by the tool named in the target, so a test targeting `send_email,arg~vendor-compliance` shows on the `send_email` outcome. The tooltip keeps the full target.
+
+## Live guard
+
+`Guard.check(rt, agent, tool, args, decision, sensitive)` runs inside `Agent.act` (or `Agent.check` for adapters) before the tool executes, on a snapshot of the log so far. The built-in rule is the alert rule above: a `high` alert when some argument value appears only in untrusted content (`untrusted-value`), else a `review` alert when the deciding call's output is untrusted (`untrusted-upstream`). Custom rules return an alert dict. In `block` mode an alert whose severity is in `block_on` stops the call. The verdict is stored on the action event, so it is hash-chained with it.
+
+## Live server
+
+A watcher thread polls the runs folder every 0.5 s. When a run's `events.jsonl` changes (written locally or by ingest), the server recomputes that run's alerts. Alerts it has not announced before go out on `/api/stream`, and high ones to `--webhook`. Runs already present at start-up are indexed silently, so only new alerts are announced.
+
+## Tracekit import
+
+`causeway.importers.tracekit` reads a Tracekit ledger (`ledger/ledger.jsonl`) and writes a Causeway run `tk-<run id>` plus `tracekit-map.json` (`{"events": {causeway event id: [{seq, hash, type}, ...]}}`). The mapping is in the README. Hashes are not shared: Tracekit hashes raw content with its own canonical form and Causeway hashes `{"v": value}`, so the map, not content hashes, is the join between the two.
